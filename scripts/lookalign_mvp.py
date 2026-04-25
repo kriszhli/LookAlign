@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -524,6 +525,30 @@ def apply_luminance_curve(luma: np.ndarray, curve: Dict[str, Any]) -> np.ndarray
     return np.interp(luma.reshape(-1), x, y).reshape(luma.shape).astype(np.float32)
 
 
+def chroma_delta_metrics(src_lab: np.ndarray, out_lab: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
+    valid = mask > 0.5
+    if not np.any(valid):
+        return {
+            "mean_delta_lab": [0.0, 0.0, 0.0],
+            "max_delta_lab": [0.0, 0.0, 0.0],
+            "neutral_region_avg_ab_shift": [0.0, 0.0],
+        }
+    delta = out_lab - src_lab
+    mean_delta = [float(delta[..., c][valid].mean()) for c in range(3)]
+    max_delta = [float(np.max(np.abs(delta[..., c][valid]))) for c in range(3)]
+    src_sat = src_lab[..., 1:3]
+    neutral = valid & (np.linalg.norm(src_sat, axis=-1) < 0.055)
+    if np.any(neutral):
+        neutral_shift = [float(delta[..., 1][neutral].mean()), float(delta[..., 2][neutral].mean())]
+    else:
+        neutral_shift = [0.0, 0.0]
+    return {
+        "mean_delta_lab": mean_delta,
+        "max_delta_lab": max_delta,
+        "neutral_region_avg_ab_shift": neutral_shift,
+    }
+
+
 def global_color_transfer(
     src_canvas: np.ndarray,
     ref_canvas: np.ndarray,
@@ -532,6 +557,11 @@ def global_color_transfer(
     blur_sigma: float,
     mean_trust: float,
     min_luma_std_ratio: float,
+    global_chroma_mean_strength: float,
+    global_chroma_std_strength: float,
+    max_global_a_shift: float,
+    max_global_b_shift: float,
+    use_rgb_affine: bool,
     warnings: List[str],
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     src_low = mask_aware_blur(src_canvas, source_mask, blur_sigma)
@@ -545,19 +575,25 @@ def global_color_transfer(
             "space": space,
             "enabled": False,
             "strength": 0.0,
-            "src_mean": [0.0, 0.0, 0.0],
-            "ref_mean": [0.0, 0.0, 0.0],
-            "scale": [1.0, 1.0, 1.0],
-            "offset": [0.0, 0.0, 0.0],
+            "src_chroma_mean": [0.0, 0.0],
+            "ref_chroma_mean": [0.0, 0.0],
+            "chroma_scale": [1.0, 1.0],
+            "chroma_offset": [0.0, 0.0],
             "luma_curve": None,
+            "rgb_affine_used": bool(use_rgb_affine),
         }
         return src_canvas.copy(), params
 
     luma_curve = fit_luminance_tone_curve(src_fit[..., 0], ref_fit[..., 0], weights, min_luma_std_ratio)
     src_mean_ab, src_std_ab = weighted_mean_std(src_fit[..., 1:3], weights)
     ref_mean_ab, ref_std_ab = weighted_mean_std(ref_fit[..., 1:3], weights)
-    scale_ab = np.clip(ref_std_ab / np.maximum(src_std_ab, 0.012), 0.65, 1.55)
-    offset_ab = np.clip(ref_mean_ab - src_mean_ab * scale_ab, -0.16, 0.16)
+    mean_strength = float(np.clip(global_chroma_mean_strength, 0.0, 1.0))
+    std_strength = float(np.clip(global_chroma_std_strength, 0.0, 1.0))
+    max_shift = np.array([max_global_a_shift, max_global_b_shift], dtype=np.float32)
+    raw_scale_ab = np.clip(ref_std_ab / np.maximum(src_std_ab, 0.012), 0.75, 1.35)
+    scale_ab = 1.0 + (raw_scale_ab - 1.0) * std_strength
+    target_mean_ab = src_mean_ab + (ref_mean_ab - src_mean_ab) * mean_strength
+    offset_ab = np.clip(target_mean_ab - src_mean_ab * scale_ab, -max_shift, max_shift)
     strength = 1.0 if mean_trust >= 0.22 else float(np.clip(0.35 + mean_trust, 0.25, 0.65))
 
     src_full, _ = rgb_to_lab(src_canvas)
@@ -574,12 +610,19 @@ def global_color_transfer(
         "enabled": True,
         "strength": strength,
         "tone_strength": tone_strength,
+        "global_chroma_mean_strength": mean_strength,
+        "global_chroma_std_strength": std_strength,
+        "max_global_a_shift": float(max_shift[0]),
+        "max_global_b_shift": float(max_shift[1]),
         "src_chroma_mean": src_mean_ab.tolist(),
         "ref_chroma_mean": ref_mean_ab.tolist(),
         "src_chroma_std": src_std_ab.tolist(),
         "ref_chroma_std": ref_std_ab.tolist(),
+        "target_chroma_mean": target_mean_ab.tolist(),
+        "raw_chroma_scale": raw_scale_ab.tolist(),
         "chroma_scale": scale_ab.tolist(),
         "chroma_offset": offset_ab.tolist(),
+        "rgb_affine_used": bool(use_rgb_affine),
         "luma_curve": {
             "quantiles": luma_curve["quantiles"].tolist(),
             "src_quantiles": luma_curve["src_quantiles"].tolist(),
@@ -688,9 +731,20 @@ def apply_detail_preservation(src: np.ndarray, transferred: np.ndarray, mask: np
 
 
 def protect_output(src: np.ndarray, out: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    src_lab, space = rgb_to_lab(src)
+    out_lab, _ = rgb_to_lab(out)
     src_l = luminance(src)
     out_l = luminance(out)
     src_sat = src.max(axis=-1) - src.min(axis=-1)
+    out_sat = out.max(axis=-1) - out.min(axis=-1)
+    out_gray = np.repeat(out_l[..., None], 3, axis=-1)
+
+    neutral_region = np.clip((0.12 - src_sat) / 0.12, 0.0, 1.0)
+    tonal_guard = np.clip(np.abs(src_l - 0.5) / 0.5, 0.0, 1.0)
+    neutral_guard = np.clip(neutral_region + 0.50 * tonal_guard * neutral_region, 0.0, 1.0)
+    out_lab[..., 1:3] = out_lab[..., 1:3] * (1.0 - 0.85 * neutral_guard[..., None]) + src_lab[..., 1:3] * (0.85 * neutral_guard[..., None])
+    out = lab_to_rgb(out_lab, space)
+    out_l = luminance(out)
     out_sat = out.max(axis=-1) - out.min(axis=-1)
     out_gray = np.repeat(out_l[..., None], 3, axis=-1)
 
@@ -836,6 +890,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-luma-std-ratio", type=float, default=0.85, help="Minimum output/source luminance std ratio enforced by anti-fade guard.")
     parser.add_argument("--min-saturation-ratio", type=float, default=0.80, help="Minimum output/source saturation ratio enforced by anti-fade guard.")
     parser.add_argument("--anti-fade-strength", type=float, default=1.0, help="Strength for final contrast and saturation anti-fade guard.")
+    parser.add_argument("--global-chroma-mean-strength", type=float, default=0.35, help="Blend strength for global Lab a/b mean transfer.")
+    parser.add_argument("--global-chroma-std-strength", type=float, default=0.65, help="Blend strength for global Lab a/b std transfer.")
+    parser.add_argument("--max-global-a-shift", type=float, default=0.035, help="Maximum absolute global Lab a shift.")
+    parser.add_argument("--max-global-b-shift", type=float, default=0.045, help="Maximum absolute global Lab b shift.")
+    parser.add_argument("--use-rgb-affine", action="store_true", help="Enable optional RGB affine chroma correction.")
     return parser.parse_args()
 
 
@@ -854,6 +913,11 @@ def lookalign_defaults() -> Dict[str, Any]:
         "min_luma_std_ratio": 0.85,
         "min_saturation_ratio": 0.80,
         "anti_fade_strength": 1.0,
+        "global_chroma_mean_strength": 0.35,
+        "global_chroma_std_strength": 0.65,
+        "max_global_a_shift": 0.035,
+        "max_global_b_shift": 0.045,
+        "use_rgb_affine": False,
     }
 
 
@@ -937,6 +1001,11 @@ def run_lookalign(
         args.blur_sigma,
         mean_trust,
         args.min_luma_std_ratio,
+        args.global_chroma_mean_strength,
+        args.global_chroma_std_strength,
+        args.max_global_a_shift,
+        args.max_global_b_shift,
+        args.use_rgb_affine,
         warnings,
     )
 
@@ -964,6 +1033,9 @@ def run_lookalign(
         args.min_saturation_ratio,
         args.anti_fade_strength,
     )
+    src_lab_full, _ = rgb_to_lab(source_canvas)
+    guarded_lab, _ = rgb_to_lab(guarded)
+    chroma_metrics = chroma_delta_metrics(src_lab_full, guarded_lab, source_mask)
     output = crop_source(guarded, offset, src.shape)
     output = finite01(output)
     save_rgb(args.output, output)
@@ -982,6 +1054,7 @@ def run_lookalign(
         "mean_trust": mean_trust,
         "trusted_pixel_count": trusted_count,
         "global_fit_parameters": global_params,
+        "chroma_transfer_metrics": chroma_metrics,
         "local_strength_used": float(local_strength if local_enabled else 0.0),
         "local_luma_strength": float(args.local_luma_strength),
         "anti_fade_guard": guard_metrics,

@@ -31,6 +31,12 @@ def mean_lab_ab(img: np.ndarray) -> np.ndarray:
     return lab[..., 1:3].reshape(-1, 2).mean(axis=0)
 
 
+def warm_reference(size: int = 96) -> np.ndarray:
+    y, x = np.mgrid[0:size, 0:size].astype(np.float32)
+    base = 0.52 + 0.10 * np.sin(x / 8.5) + 0.07 * np.cos(y / 10.5)
+    return np.stack([base * 1.18, base * 0.98, base * 0.86], axis=-1).astype(np.float32)
+
+
 class LookAlignAntiFadeTests(unittest.TestCase):
     def run_synthetic(self, source: np.ndarray, reference: np.ndarray, **config: object) -> np.ndarray:
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,6 +99,38 @@ class LookAlignAntiFadeTests(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertLess(l_delta, 0.012)
         self.assertGreater(ab_delta, 0.004)
+
+    def test_neutral_gray_source_does_not_turn_red(self) -> None:
+        source = np.full((96, 96, 3), 0.52, dtype=np.float32)
+        reference = warm_reference(96)
+        output = self.run_synthetic(source, reference)
+        out_ab = mean_lab_ab(output)
+        self.assertLess(abs(float(out_ab[0]) - 0.5), 0.02)
+        self.assertLess(abs(float(out_ab[1]) - 0.5), 0.025)
+
+    def test_white_and_gray_patches_remain_near_neutral(self) -> None:
+        source = np.full((96, 96, 3), 0.50, dtype=np.float32)
+        source[:, :32] = 0.96
+        source[:, 32:64] = 0.70
+        source[:, 64:] = 0.18
+        reference = warm_reference(96)
+        output = self.run_synthetic(source, reference)
+        out_lab, _ = la.rgb_to_lab(output)
+        for sl in [slice(0, 32), slice(32, 64), slice(64, 96)]:
+            patch_ab = out_lab[:, sl, 1:3].reshape(-1, 2).mean(axis=0)
+            self.assertLess(abs(float(patch_ab[0]) - 0.5), 0.025)
+            self.assertLess(abs(float(patch_ab[1]) - 0.5), 0.03)
+
+    def test_chroma_moves_in_non_neutral_regions(self) -> None:
+        size = 96
+        source = np.full((size, size, 3), [0.22, 0.48, 0.24], dtype=np.float32)
+        source[:, size // 2 :] = [0.26, 0.38, 0.70]
+        reference = np.full((size, size, 3), [0.62, 0.38, 0.20], dtype=np.float32)
+        reference[:, size // 2 :] = [0.72, 0.52, 0.28]
+        output = self.run_synthetic(source, reference)
+        src_dist = np.linalg.norm(mean_lab_ab(source) - mean_lab_ab(reference))
+        out_dist = np.linalg.norm(mean_lab_ab(output) - mean_lab_ab(reference))
+        self.assertLess(out_dist, src_dist * 0.90)
 
 
 if __name__ == "__main__":
