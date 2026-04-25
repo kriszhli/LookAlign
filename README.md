@@ -1,4 +1,4 @@
-# LookAlign V(latest)
+# LookAlign V0.1
 
 Version log for LookAlign.
 
