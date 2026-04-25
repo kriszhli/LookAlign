@@ -660,8 +660,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def lookalign_defaults() -> Dict[str, Any]:
+    return {
+        "debug_dir": None,
+        "align": "auto",
+        "align_scale_min": 0.25,
+        "align_scale_max": 8.0,
+        "grid": 16,
+        "blur_sigma": 24.0,
+        "local_strength": 0.65,
+        "detail_strength": 1.0,
+        "trust_threshold": 0.15,
+    }
+
+
+def _config_to_namespace(config: Optional[Dict[str, Any] | argparse.Namespace]) -> argparse.Namespace:
+    values = lookalign_defaults()
+    if config is not None:
+        if isinstance(config, argparse.Namespace):
+            values.update(vars(config))
+        else:
+            values.update(config)
+    return argparse.Namespace(**values)
+
+
+def run_lookalign(
+    source_path: str | Path,
+    reference_path: str | Path,
+    output_path: str | Path,
+    config: Optional[Dict[str, Any] | argparse.Namespace] = None,
+) -> Dict[str, Any]:
+    args = _config_to_namespace(config)
+    args.source = str(source_path)
+    args.reference = str(reference_path)
+    args.output = str(output_path)
+
     warnings: List[str] = []
     src = load_rgb(args.source)
     ref = load_rgb(args.reference)
@@ -766,12 +799,43 @@ def main() -> int:
         },
     )
 
-    if warnings:
-        for msg in warnings:
-            print(f"warning: {msg}")
-    print(f"wrote {args.output}")
+    debug_paths: Dict[str, str] = {}
     if args.debug_dir:
-        print(f"wrote debug data to {args.debug_dir}")
+        debug_dir = Path(args.debug_dir)
+        for name in (
+            "aligned_reference",
+            "source_lowfreq",
+            "reference_lowfreq",
+            "global_result",
+            "local_field_visualization",
+            "local_result",
+            "final_output",
+            "reference_valid_mask",
+            "overlap_mask",
+            "trust_map",
+        ):
+            debug_paths[name] = str(debug_dir / f"{name}.png")
+        debug_paths["debug_json"] = str(debug_dir / "debug.json")
+
+    return {
+        "output_path": str(args.output),
+        "debug_dir": args.debug_dir,
+        "debug_paths": debug_paths,
+        "metadata": debug_data,
+        "warnings": warnings,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    result = run_lookalign(args.source, args.reference, args.output, args)
+
+    if result["warnings"]:
+        for msg in result["warnings"]:
+            print(f"warning: {msg}")
+    print(f"wrote {result['output_path']}")
+    if result["debug_dir"]:
+        print(f"wrote debug data to {result['debug_dir']}")
     return 0
 
 
