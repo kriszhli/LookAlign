@@ -295,6 +295,63 @@ def estimate_phase_translation(src: np.ndarray, ref: np.ndarray, matrix: np.ndar
     return out.astype(np.float32), float(np.clip(response, 0.0, 1.0))
 
 
+def rescale_transform_about_ref_center(matrix: np.ndarray, ref_shape: Tuple[int, int, int], scale_multiplier: float) -> np.ndarray:
+    hr, wr = ref_shape[:2]
+    center = np.array([0.5 * wr, 0.5 * hr], dtype=np.float32)
+    mapped_center = matrix[:, :2] @ center + matrix[:, 2]
+    out = matrix.astype(np.float32).copy()
+    out[:, :2] *= float(scale_multiplier)
+    out[:, 2] = mapped_center - out[:, :2] @ center
+    return out.astype(np.float32)
+
+
+def masked_alignment_score(src: np.ndarray, ref: np.ndarray, matrix: np.ndarray) -> float:
+    hs, ws = src.shape[:2]
+    ref_warp, ref_mask = warp_to_shape(ref, np.ones(ref.shape[:2], dtype=np.float32), matrix, (hs, ws))
+    overlap = ref_mask > 0.2
+    if int(overlap.sum()) < max(1000, int(0.01 * hs * ws)):
+        return -1.0
+    src_l = gaussian_blur(luminance(src), 6.0)
+    ref_l = gaussian_blur(luminance(ref_warp), 6.0)
+    src_vals = src_l[overlap].astype(np.float64)
+    ref_vals = ref_l[overlap].astype(np.float64)
+    src_vals -= src_vals.mean()
+    ref_vals -= ref_vals.mean()
+    den = float(np.linalg.norm(src_vals) * np.linalg.norm(ref_vals))
+    if den <= EPS:
+        return -1.0
+    return float(np.dot(src_vals, ref_vals) / den)
+
+
+def refine_alignment_scale(src: np.ndarray, ref: np.ndarray, matrix: np.ndarray, warnings: List[str]) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    if cv2 is None:
+        return matrix, 0.0, {}
+    base_score = masked_alignment_score(src, ref, matrix)
+    if base_score < -0.5:
+        return matrix, 0.0, {}
+
+    best_matrix = matrix.astype(np.float32)
+    best_score = base_score
+    best_multiplier = 1.0
+    candidates = [0.94, 0.97, 0.985, 1.0, 1.015, 1.03, 1.06]
+    for multiplier in candidates:
+        candidate = rescale_transform_about_ref_center(matrix, ref.shape, multiplier)
+        candidate, _ = estimate_phase_translation(src, ref, candidate, warnings=[])
+        score = masked_alignment_score(src, ref, candidate)
+        if score > best_score + 0.002:
+            best_matrix = candidate
+            best_score = score
+            best_multiplier = float(multiplier)
+
+    if best_multiplier != 1.0:
+        warnings.append(f"Alignment scale refined by {best_multiplier:.4f}x.")
+    return best_matrix.astype(np.float32), float(np.clip(best_score - base_score, 0.0, 1.0)), {
+        "scale_refine_multiplier": best_multiplier,
+        "scale_refine_score_before": float(base_score),
+        "scale_refine_score_after": float(best_score),
+    }
+
+
 def estimate_alignment(args: argparse.Namespace, src: np.ndarray, ref: np.ndarray, warnings: List[str]) -> Tuple[np.ndarray, str, float, Dict[str, Any]]:
     if args.align == "identity":
         return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32), "identity", 1.0, {}
@@ -304,14 +361,19 @@ def estimate_alignment(args: argparse.Namespace, src: np.ndarray, ref: np.ndarra
     feature = estimate_feature_alignment(src, ref, args.align_scale_min, args.align_scale_max, warnings)
     if feature is not None:
         mat, confidence, info = feature
-        return mat, "auto_feature", confidence, info
+        mat, refine_gain, refine_info = refine_alignment_scale(src, ref, mat, warnings)
+        info.update(refine_info)
+        return mat, "auto_feature", float(np.clip(confidence + 0.10 * refine_gain, 0.0, 1.0)), info
 
     fit = scale_fit_transform(src.shape, ref.shape)
     fit, phase_conf = estimate_phase_translation(src, ref, fit, warnings)
+    fit, refine_gain, refine_info = refine_alignment_scale(src, ref, fit, warnings)
     ok, reason, overlap = validate_transform(fit, ref.shape, src.shape, args.align_scale_min, args.align_scale_max, min_overlap=0.03)
     if ok:
-        conf = 0.30 + 0.35 * phase_conf
-        return fit, "auto_scale_fit_phase" if phase_conf > 0 else "auto_scale_fit", conf, {"fallback_overlap_ratio": overlap, "phase_confidence": phase_conf}
+        conf = 0.30 + 0.35 * phase_conf + 0.10 * refine_gain
+        info = {"fallback_overlap_ratio": overlap, "phase_confidence": phase_conf}
+        info.update(refine_info)
+        return fit, "auto_scale_fit_phase" if phase_conf > 0 else "auto_scale_fit", conf, info
 
     warnings.append(f"Scale-fit fallback rejected: {reason}; using centered native-size alignment.")
     return center_transform(src.shape, ref.shape), "auto_center_fallback", 0.15, {}

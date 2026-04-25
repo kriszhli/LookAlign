@@ -17,7 +17,7 @@ DEFAULT_SOURCE = ROOT / "inputs" / "source.png"
 DEFAULT_REFERENCE = ROOT / "inputs" / "reference.png"
 OUTPUTS_DIR = ROOT / "outputs"
 
-IMAGE_OPTIONS = ["Source", "Reference", "LookAlign Output"]
+IMAGE_OPTIONS = ["Source", "Aligned Reference", "LookAlign Output"]
 
 
 def existing_path(path: Path) -> Optional[str]:
@@ -78,7 +78,7 @@ def run_ui(
     debug_paths = result["debug_paths"]
     paths = {
         "Source": source,
-        "Reference": reference,
+        "Aligned Reference": debug_paths.get("aligned_reference"),
         "LookAlign Output": result["output_path"],
     }
 
@@ -211,10 +211,10 @@ def build_app() -> gr.Blocks:
         with gr.Row():
             with gr.Column():
                 with gr.Row():
-                    compare_a = gr.Dropdown(IMAGE_OPTIONS, value="Source", label="Comparison A")
+                    compare_a = gr.Dropdown(IMAGE_OPTIONS, value="Aligned Reference", label="Comparison A")
                     compare_b = gr.Dropdown(IMAGE_OPTIONS, value="LookAlign Output", label="Comparison B")
                 comparison = gr.ImageSlider(
-                    value=build_comparison_value(defaults, "Source", "Reference"),
+                    value=build_comparison_value({"Source": defaults["Source"], "Aligned Reference": defaults["Reference"], "LookAlign Output": defaults["Reference"]}, "Aligned Reference", "LookAlign Output"),
                     type="filepath",
                     label="Before / after comparison",
                     interactive=False,
