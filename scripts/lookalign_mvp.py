@@ -24,6 +24,11 @@ try:
 except Exception:  # pragma: no cover - SciPy is expected in the local MVP env.
     ndimage = None
 
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover - PyTorch is optional for legacy fallback.
+    torch = None
+
 
 EPS = 1e-6
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
@@ -611,6 +616,304 @@ def chroma_delta_metrics(src_lab: np.ndarray, out_lab: np.ndarray, mask: np.ndar
     }
 
 
+def choose_sa_lut_device(prefer_mps: bool = True) -> Tuple[str, Dict[str, Any]]:
+    if torch is None:
+        return "none", {"torch_available": False, "mps_built": False, "mps_available": False}
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    mps_built = bool(mps_backend is not None and mps_backend.is_built())
+    mps_available = bool(mps_backend is not None and mps_backend.is_available())
+    device = "mps" if prefer_mps and mps_available else "cpu"
+    return device, {"torch_available": True, "mps_built": mps_built, "mps_available": mps_available}
+
+
+def resolve_render_backend(render_backend: str, warnings: List[str]) -> Tuple[str, Optional[str]]:
+    requested = str(render_backend or "auto").lower()
+    if requested in ("numpy", "opencv", "torch", "pytorch"):
+        return "pytorch", None
+    if requested in ("coreimage", "core_image", "accelerate"):
+        try:
+            __import__("objc")
+            __import__("CoreImage")
+            return requested, None
+        except Exception:
+            reason = "Core Image/Accelerate Python bindings are unavailable; using PyTorch/NumPy rendering."
+            warnings.append(reason)
+            return "pytorch", reason
+    if requested == "auto":
+        try:
+            __import__("objc")
+            __import__("CoreImage")
+            return "coreimage", None
+        except Exception:
+            return "pytorch", "Core Image/Accelerate Python bindings are unavailable; using PyTorch/NumPy rendering."
+    reason = f"Unknown render_backend '{render_backend}'; using PyTorch/NumPy rendering."
+    warnings.append(reason)
+    return "pytorch", reason
+
+
+def sa_lut_log_encode(rgb: np.ndarray) -> np.ndarray:
+    rgb = finite01(rgb)
+    return (np.log1p(9.0 * rgb) / math.log(10.0)).astype(np.float32)
+
+
+def sa_lut_log_decode(encoded: np.ndarray) -> np.ndarray:
+    encoded = finite01(encoded)
+    return finite01((np.power(10.0, encoded) - 1.0) / 9.0)
+
+
+def identity_sa_lut(size: int, context_bins: int) -> np.ndarray:
+    axis = np.linspace(0.0, 1.0, int(size), dtype=np.float32)
+    rr, gg, bb = np.meshgrid(axis, axis, axis, indexing="ij")
+    decoded = sa_lut_log_decode(np.stack([rr, gg, bb], axis=-1))
+    return np.repeat(decoded[None, ...], int(context_bins), axis=0).astype(np.float32)
+
+
+def generate_sa_lut_context_map(
+    src_low: np.ndarray,
+    ref_low: np.ndarray,
+    weights: np.ndarray,
+    source_mask: np.ndarray,
+    device_name: str,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    if torch is None or device_name == "none":
+        luma = luminance(src_low)
+        context = (luma - float(luma[source_mask > 0.5].min())) / max(float(np.ptp(luma[source_mask > 0.5])), EPS) if np.any(source_mask > 0.5) else luma
+        return np.clip(context, 0.0, 1.0).astype(np.float32), {"device": "numpy_fallback"}
+
+    device = torch.device(device_name)
+    src_t = torch.from_numpy(finite01(src_low)).to(device=device, dtype=torch.float32)
+    ref_t = torch.from_numpy(finite01(ref_low)).to(device=device, dtype=torch.float32)
+    weights_t = torch.from_numpy(np.clip(weights, 0.0, 1.0).astype(np.float32)).to(device=device)
+    mask_t = torch.from_numpy(np.clip(source_mask, 0.0, 1.0).astype(np.float32)).to(device=device)
+    luma_w = torch.tensor([0.2126, 0.7152, 0.0722], device=device, dtype=torch.float32)
+    src_l = (src_t * luma_w).sum(dim=-1)
+    ref_l = (ref_t * luma_w).sum(dim=-1)
+    src_sat = src_t.max(dim=-1).values - src_t.min(dim=-1).values
+    ref_sat = ref_t.max(dim=-1).values - ref_t.min(dim=-1).values
+    valid = mask_t > 0.5
+    if bool(valid.any().item()):
+        src_l_norm = (src_l - src_l[valid].min()) / torch.clamp(src_l[valid].max() - src_l[valid].min(), min=EPS)
+        sat_norm = (src_sat - src_sat[valid].min()) / torch.clamp(src_sat[valid].max() - src_sat[valid].min(), min=EPS)
+    else:
+        src_l_norm = src_l
+        sat_norm = src_sat
+    look_delta = torch.clamp(torch.abs(ref_l - src_l) * 1.7 + torch.abs(ref_sat - src_sat) * 0.8, 0.0, 1.0)
+    context = torch.clamp(0.55 * src_l_norm + 0.25 * sat_norm + 0.20 * look_delta, 0.0, 1.0)
+    context = context * torch.clamp(0.65 + 0.35 * weights_t, 0.0, 1.0)
+    return context.detach().cpu().numpy().astype(np.float32), {"device": device_name}
+
+
+def fit_sa_lut(
+    src_low: np.ndarray,
+    ref_low: np.ndarray,
+    context_map: np.ndarray,
+    weights: np.ndarray,
+    size: int,
+    context_bins: int,
+    max_samples: int,
+    ridge: float,
+    smooth: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    size = max(2, int(size))
+    context_bins = max(2, int(context_bins))
+    identity = identity_sa_lut(size, context_bins)
+    valid = np.flatnonzero((weights.reshape(-1) > 0.0) & np.isfinite(src_low.reshape(-1, 3)).all(axis=1) & np.isfinite(ref_low.reshape(-1, 3)).all(axis=1))
+    if valid.size < 100:
+        return identity, {"fit_sample_count": int(valid.size), "enabled": False, "fallback_reason": "insufficient trusted samples"}
+
+    if max_samples > 0 and valid.size > int(max_samples):
+        order = np.argsort(weights.reshape(-1)[valid])
+        valid = valid[order[-int(max_samples) :]]
+
+    src_flat = sa_lut_log_encode(src_low.reshape(-1, 3)[valid])
+    ref_flat = finite01(ref_low.reshape(-1, 3)[valid])
+    base_flat = finite01(src_low.reshape(-1, 3)[valid])
+    ctx_flat = np.clip(context_map.reshape(-1)[valid], 0.0, 1.0)
+    w_flat = np.clip(weights.reshape(-1)[valid], 0.0, 1.0).astype(np.float32)
+    residual = np.clip(ref_flat - base_flat, -0.35, 0.35).astype(np.float32)
+
+    res_sum = np.zeros((context_bins, size, size, size, 3), dtype=np.float32)
+    weight_sum = np.zeros((context_bins, size, size, size), dtype=np.float32)
+    color_pos = src_flat * float(size - 1)
+    c0 = np.floor(color_pos).astype(np.int32)
+    cf = (color_pos - c0).astype(np.float32)
+    c0 = np.clip(c0, 0, size - 1)
+    c1 = np.clip(c0 + 1, 0, size - 1)
+    ctx_pos = ctx_flat * float(context_bins - 1)
+    k0 = np.floor(ctx_pos).astype(np.int32)
+    kf = (ctx_pos - k0).astype(np.float32)
+    k0 = np.clip(k0, 0, context_bins - 1)
+    k1 = np.clip(k0 + 1, 0, context_bins - 1)
+
+    for kr, kw in ((k0, 1.0 - kf), (k1, kf)):
+        for ri, rw in ((c0[:, 0], 1.0 - cf[:, 0]), (c1[:, 0], cf[:, 0])):
+            for gi, gw in ((c0[:, 1], 1.0 - cf[:, 1]), (c1[:, 1], cf[:, 1])):
+                for bi, bw in ((c0[:, 2], 1.0 - cf[:, 2]), (c1[:, 2], cf[:, 2])):
+                    ww = (w_flat * kw * rw * gw * bw).astype(np.float32)
+                    np.add.at(res_sum, (kr, ri, gi, bi, slice(None)), residual * ww[:, None])
+                    np.add.at(weight_sum, (kr, ri, gi, bi), ww)
+
+    denom = weight_sum[..., None] + float(max(ridge, EPS))
+    fitted_residual = res_sum / denom
+    if smooth > 0.0:
+        if ndimage is not None:
+            sigma = (0.0, float(smooth), float(smooth), float(smooth), 0.0)
+            smooth_w = ndimage.gaussian_filter(weight_sum, sigma=(0.0, float(smooth), float(smooth), float(smooth)), mode="nearest")
+            smooth_r = ndimage.gaussian_filter(fitted_residual * weight_sum[..., None], sigma=sigma, mode="nearest")
+            fitted_residual = smooth_r / np.maximum(smooth_w[..., None], float(max(ridge, EPS)))
+        elif cv2 is not None:
+            for k in range(context_bins):
+                for c in range(3):
+                    for z in range(size):
+                        fitted_residual[k, z, ..., c] = cv2.GaussianBlur(fitted_residual[k, z, ..., c], (0, 0), sigmaX=float(smooth))
+
+    confidence = np.clip(weight_sum[..., None] / max(float(np.percentile(weight_sum[weight_sum > 0], 75)) if np.any(weight_sum > 0) else 1.0, EPS), 0.0, 1.0)
+    lut = identity + np.clip(fitted_residual, -0.30, 0.30) * confidence
+    return finite01(lut), {
+        "fit_sample_count": int(valid.size),
+        "enabled": True,
+        "filled_cell_count": int(np.count_nonzero(weight_sum > 0.0)),
+        "active_context_min": float(ctx_flat.min()),
+        "active_context_max": float(ctx_flat.max()),
+    }
+
+
+def apply_sa_lut_torch(src_canvas: np.ndarray, context_map: np.ndarray, lut: np.ndarray, source_mask: np.ndarray, device_name: str) -> np.ndarray:
+    if torch is None or device_name == "none":
+        return src_canvas.copy()
+    device = torch.device(device_name)
+    encoded = torch.from_numpy(sa_lut_log_encode(src_canvas)).to(device=device, dtype=torch.float32)
+    context = torch.from_numpy(np.clip(context_map, 0.0, 1.0).astype(np.float32)).to(device=device)
+    mask = torch.from_numpy(np.clip(source_mask, 0.0, 1.0).astype(np.float32)).to(device=device)
+    lut_t = torch.from_numpy(finite01(lut)).to(device=device, dtype=torch.float32)
+    context_bins, size = int(lut_t.shape[0]), int(lut_t.shape[1])
+
+    flat = encoded.reshape(-1, 3)
+    ctx = context.reshape(-1)
+    pos = flat * float(size - 1)
+    p0 = torch.floor(pos).to(torch.long)
+    pf = pos - p0.to(torch.float32)
+    p0 = torch.clamp(p0, 0, size - 1)
+    p1 = torch.clamp(p0 + 1, 0, size - 1)
+    cpos = ctx * float(context_bins - 1)
+    k0 = torch.clamp(torch.floor(cpos).to(torch.long), 0, context_bins - 1)
+    k1 = torch.clamp(k0 + 1, 0, context_bins - 1)
+    kf = cpos - k0.to(torch.float32)
+
+    def interp_context(k: Any) -> Any:
+        out = torch.zeros((flat.shape[0], 3), device=device, dtype=torch.float32)
+        for ri, rw in ((p0[:, 0], 1.0 - pf[:, 0]), (p1[:, 0], pf[:, 0])):
+            for gi, gw in ((p0[:, 1], 1.0 - pf[:, 1]), (p1[:, 1], pf[:, 1])):
+                for bi, bw in ((p0[:, 2], 1.0 - pf[:, 2]), (p1[:, 2], pf[:, 2])):
+                    out = out + lut_t[k, ri, gi, bi] * (rw * gw * bw).unsqueeze(-1)
+        return out
+
+    out0 = interp_context(k0)
+    out1 = interp_context(k1)
+    out = out0 * (1.0 - kf).unsqueeze(-1) + out1 * kf.unsqueeze(-1)
+    out = out.reshape(src_canvas.shape)
+    out = out * mask.unsqueeze(-1) + torch.from_numpy(src_canvas.astype(np.float32)).to(device=device) * (1.0 - mask.unsqueeze(-1))
+    return finite01(out.detach().cpu().numpy())
+
+
+def sa_lut_global_color_transfer(
+    src_canvas: np.ndarray,
+    ref_canvas: np.ndarray,
+    source_mask: np.ndarray,
+    weights: np.ndarray,
+    blur_sigma: float,
+    args: argparse.Namespace,
+    warnings: List[str],
+) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray]:
+    device_name, device_info = choose_sa_lut_device(prefer_mps=True)
+    selected_backend, backend_reason = resolve_render_backend(getattr(args, "render_backend", "auto"), warnings)
+    if torch is None:
+        warnings.append("PyTorch unavailable; falling back to legacy global color transfer.")
+        legacy, params = global_color_transfer(
+            src_canvas,
+            ref_canvas,
+            source_mask,
+            weights,
+            blur_sigma,
+            0.0,
+            args.min_luma_std_ratio,
+            args.global_chroma_mean_strength,
+            args.global_chroma_std_strength,
+            args.max_global_a_shift,
+            args.max_global_b_shift,
+            args.use_rgb_affine,
+            warnings,
+        )
+        params.update({"method": "legacy_lab", "fallback_reason": "torch unavailable"})
+        return legacy, params, np.zeros(source_mask.shape, dtype=np.float32)
+
+    src_low = mask_aware_blur(src_canvas, source_mask, blur_sigma)
+    ref_low = mask_aware_blur(ref_canvas, (weights > 0).astype(np.float32), blur_sigma)
+    try:
+        context_map, context_info = generate_sa_lut_context_map(src_low, ref_low, weights, source_mask, device_name)
+    except Exception as exc:
+        if device_name != "mps":
+            raise
+        warnings.append(f"SA-LUT MPS context generation failed ({exc}); retrying on CPU.")
+        device_name = "cpu"
+        context_map, context_info = generate_sa_lut_context_map(src_low, ref_low, weights, source_mask, device_name)
+    lut, fit_info = fit_sa_lut(
+        src_low,
+        ref_low,
+        context_map,
+        weights,
+        getattr(args, "sa_lut_size", 17),
+        getattr(args, "sa_lut_context_bins", 2),
+        getattr(args, "sa_lut_fit_max_samples", 250000),
+        getattr(args, "sa_lut_ridge", 0.035),
+        getattr(args, "sa_lut_smooth", 0.75),
+    )
+    if not fit_info.get("enabled", False):
+        warnings.append("SA-LUT fitting skipped; falling back to legacy global color transfer.")
+        legacy, params = global_color_transfer(
+            src_canvas,
+            ref_canvas,
+            source_mask,
+            weights,
+            blur_sigma,
+            0.0,
+            args.min_luma_std_ratio,
+            args.global_chroma_mean_strength,
+            args.global_chroma_std_strength,
+            args.max_global_a_shift,
+            args.max_global_b_shift,
+            args.use_rgb_affine,
+            warnings,
+        )
+        params.update({"method": "legacy_lab", "fallback_reason": fit_info.get("fallback_reason", "sa_lut disabled")})
+        return legacy, params, context_map
+
+    try:
+        result = apply_sa_lut_torch(src_canvas, context_map, lut, source_mask, device_name)
+    except Exception as exc:
+        if device_name != "mps":
+            raise
+        warnings.append(f"SA-LUT MPS LUT application failed ({exc}); retrying on CPU.")
+        device_name = "cpu"
+        result = apply_sa_lut_torch(src_canvas, context_map, lut, source_mask, device_name)
+    params = {
+        "method": "sa_lut",
+        "enabled": True,
+        "selected_device": device_name,
+        "device_info": device_info,
+        "render_backend": selected_backend,
+        "render_backend_fallback_reason": backend_reason,
+        "lut_size": int(lut.shape[1]),
+        "context_bins": int(lut.shape[0]),
+        "fit_sample_count": fit_info["fit_sample_count"],
+        "filled_cell_count": fit_info.get("filled_cell_count", 0),
+        "active_context_min": fit_info.get("active_context_min", float(context_map.min())),
+        "active_context_max": fit_info.get("active_context_max", float(context_map.max())),
+        "context_generator": context_info,
+    }
+    return finite01(result), params, context_map
+
+
 def global_color_transfer(
     src_canvas: np.ndarray,
     ref_canvas: np.ndarray,
@@ -957,6 +1260,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-global-a-shift", type=float, default=0.035, help="Maximum absolute global Lab a shift.")
     parser.add_argument("--max-global-b-shift", type=float, default=0.045, help="Maximum absolute global Lab b shift.")
     parser.add_argument("--use-rgb-affine", action="store_true", help="Enable optional RGB affine chroma correction.")
+    parser.add_argument("--global-match-method", choices=["sa_lut", "legacy_lab"], default="sa_lut", help="Global match method.")
+    parser.add_argument("--sa-lut-size", type=int, default=17, help="SA-LUT RGB lattice resolution.")
+    parser.add_argument("--sa-lut-context-bins", type=int, default=2, help="SA-LUT context bin count.")
+    parser.add_argument("--sa-lut-fit-max-samples", type=int, default=250000, help="Maximum trusted samples used for SA-LUT fitting.")
+    parser.add_argument("--sa-lut-ridge", type=float, default=0.035, help="Ridge term for sparse SA-LUT cells.")
+    parser.add_argument("--sa-lut-smooth", type=float, default=0.75, help="Gaussian smoothing sigma for fitted SA-LUT residuals.")
+    parser.add_argument("--render-backend", choices=["auto", "pytorch", "numpy", "opencv", "coreimage", "accelerate"], default="auto", help="Rendering backend preference.")
     return parser.parse_args()
 
 
@@ -980,6 +1290,13 @@ def lookalign_defaults() -> Dict[str, Any]:
         "max_global_a_shift": 0.035,
         "max_global_b_shift": 0.045,
         "use_rgb_affine": False,
+        "global_match_method": "sa_lut",
+        "sa_lut_size": 17,
+        "sa_lut_context_bins": 2,
+        "sa_lut_fit_max_samples": 250000,
+        "sa_lut_ridge": 0.035,
+        "sa_lut_smooth": 0.75,
+        "render_backend": "auto",
     }
 
 
@@ -1055,21 +1372,34 @@ def run_lookalign(
     if align_conf < 0.25:
         local_strength = min(local_strength, 0.25)
 
-    global_result, global_params = global_color_transfer(
-        source_canvas,
-        reference_canvas,
-        source_mask,
-        fit_weights,
-        args.blur_sigma,
-        mean_trust,
-        args.min_luma_std_ratio,
-        args.global_chroma_mean_strength,
-        args.global_chroma_std_strength,
-        args.max_global_a_shift,
-        args.max_global_b_shift,
-        args.use_rgb_affine,
-        warnings,
-    )
+    sa_lut_context_map: Optional[np.ndarray] = None
+    if str(getattr(args, "global_match_method", "sa_lut")) == "legacy_lab":
+        global_result, global_params = global_color_transfer(
+            source_canvas,
+            reference_canvas,
+            source_mask,
+            fit_weights,
+            args.blur_sigma,
+            mean_trust,
+            args.min_luma_std_ratio,
+            args.global_chroma_mean_strength,
+            args.global_chroma_std_strength,
+            args.max_global_a_shift,
+            args.max_global_b_shift,
+            args.use_rgb_affine,
+            warnings,
+        )
+        global_params["method"] = "legacy_lab"
+    else:
+        global_result, global_params, sa_lut_context_map = sa_lut_global_color_transfer(
+            source_canvas,
+            reference_canvas,
+            source_mask,
+            fit_weights,
+            args.blur_sigma,
+            args,
+            warnings,
+        )
 
     field, local_unblended, local_enabled = compute_local_field(
         global_result,
@@ -1122,29 +1452,35 @@ def run_lookalign(
         "anti_fade_guard": guard_metrics,
         "warnings": warnings,
     }
+    debug_images = {
+        "aligned_reference": aligned_ref_vis,
+        "source_lowfreq": finite01(source_low),
+        "reference_lowfreq": finite01(reference_low),
+        "global_result": finite01(global_result),
+        "local_field_visualization": field_vis,
+        "local_result": finite01(local_result),
+        "final_output": output,
+    }
+    debug_masks = {
+        "reference_valid_mask": reference_mask,
+        "overlap_mask": overlap,
+        "trust_map": trust,
+    }
+    if sa_lut_context_map is not None:
+        debug_images["sa_lut_global_result"] = finite01(global_result)
+        debug_masks["sa_lut_context_map"] = np.clip(sa_lut_context_map, 0.0, 1.0).astype(np.float32)
+
     write_debug(
         args.debug_dir,
         debug_data,
-        images={
-            "aligned_reference": aligned_ref_vis,
-            "source_lowfreq": finite01(source_low),
-            "reference_lowfreq": finite01(reference_low),
-            "global_result": finite01(global_result),
-            "local_field_visualization": field_vis,
-            "local_result": finite01(local_result),
-            "final_output": output,
-        },
-        masks={
-            "reference_valid_mask": reference_mask,
-            "overlap_mask": overlap,
-            "trust_map": trust,
-        },
+        images=debug_images,
+        masks=debug_masks,
     )
 
     debug_paths: Dict[str, str] = {}
     if args.debug_dir:
         debug_dir = Path(args.debug_dir)
-        for name in (
+        debug_names = [
             "aligned_reference",
             "source_lowfreq",
             "reference_lowfreq",
@@ -1155,7 +1491,10 @@ def run_lookalign(
             "reference_valid_mask",
             "overlap_mask",
             "trust_map",
-        ):
+        ]
+        if sa_lut_context_map is not None:
+            debug_names.extend(["sa_lut_global_result", "sa_lut_context_map"])
+        for name in debug_names:
             debug_paths[name] = str(debug_dir / f"{name}.png")
         debug_paths["debug_json"] = str(debug_dir / "debug.json")
 

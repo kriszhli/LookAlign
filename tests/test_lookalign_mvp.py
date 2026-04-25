@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -131,6 +132,75 @@ class LookAlignAntiFadeTests(unittest.TestCase):
         src_dist = np.linalg.norm(mean_lab_ab(source) - mean_lab_ab(reference))
         out_dist = np.linalg.norm(mean_lab_ab(output) - mean_lab_ab(reference))
         self.assertLess(out_dist, src_dist * 0.90)
+
+
+class LookAlignSALUTTests(unittest.TestCase):
+    def test_sa_lut_global_match_reduces_spatial_low_frequency_error(self) -> None:
+        size = 64
+        y, x = np.mgrid[0:size, 0:size].astype(np.float32)
+        source = np.stack(
+            [
+                0.20 + 0.55 * x / max(size - 1, 1),
+                0.30 + 0.35 * y / max(size - 1, 1),
+                0.32 + 0.22 * np.sin(x / 9.0),
+            ],
+            axis=-1,
+        ).astype(np.float32)
+        source = np.clip(source, 0.0, 1.0)
+        reference = source.copy()
+        reference[:, : size // 2, 0] = np.clip(reference[:, : size // 2, 0] + 0.16, 0.0, 1.0)
+        reference[:, : size // 2, 2] = np.clip(reference[:, : size // 2, 2] - 0.07, 0.0, 1.0)
+        reference[:, size // 2 :, 0] = np.clip(reference[:, size // 2 :, 0] - 0.08, 0.0, 1.0)
+        reference[:, size // 2 :, 2] = np.clip(reference[:, size // 2 :, 2] + 0.14, 0.0, 1.0)
+        weights = np.ones((size, size), dtype=np.float32)
+        warnings: list[str] = []
+        args = la._config_to_namespace(
+            {
+                "sa_lut_size": 9,
+                "sa_lut_context_bins": 2,
+                "sa_lut_fit_max_samples": 0,
+                "sa_lut_ridge": 0.01,
+                "sa_lut_smooth": 0.25,
+                "render_backend": "pytorch",
+            }
+        )
+
+        matched, params, context = la.sa_lut_global_color_transfer(source, reference, weights, weights, 2.0, args, warnings)
+
+        self.assertEqual(params["method"], "sa_lut")
+        self.assertEqual(context.shape, weights.shape)
+        before = float(np.mean((source - reference) ** 2))
+        after = float(np.mean((matched - reference) ** 2))
+        self.assertLess(after, before * 0.75)
+
+    def test_sa_lut_insufficient_overlap_falls_back_without_crashing(self) -> None:
+        source = synthetic_source(32)
+        reference = warm_reference(32)
+        weights = np.zeros((32, 32), dtype=np.float32)
+        weights[0:2, 0:2] = 1.0
+        warnings: list[str] = []
+        args = la._config_to_namespace({"render_backend": "pytorch"})
+
+        matched, params, context = la.sa_lut_global_color_transfer(source, reference, np.ones((32, 32), dtype=np.float32), weights, 3.0, args, warnings)
+
+        self.assertEqual(matched.shape, source.shape)
+        self.assertEqual(context.shape, weights.shape)
+        self.assertEqual(params["method"], "legacy_lab")
+        self.assertTrue(any("SA-LUT fitting skipped" in msg for msg in warnings))
+
+    @unittest.skipIf(la.torch is None, "PyTorch unavailable")
+    def test_sa_lut_device_selector_prefers_mps_when_available(self) -> None:
+        with mock.patch.object(la.torch.backends.mps, "is_built", return_value=True), mock.patch.object(la.torch.backends.mps, "is_available", return_value=True):
+            device, info = la.choose_sa_lut_device(prefer_mps=True)
+        self.assertEqual(device, "mps")
+        self.assertTrue(info["mps_available"])
+
+    @unittest.skipIf(la.torch is None, "PyTorch unavailable")
+    def test_sa_lut_device_selector_falls_back_to_cpu(self) -> None:
+        with mock.patch.object(la.torch.backends.mps, "is_built", return_value=True), mock.patch.object(la.torch.backends.mps, "is_available", return_value=False):
+            device, info = la.choose_sa_lut_device(prefer_mps=True)
+        self.assertEqual(device, "cpu")
+        self.assertFalse(info["mps_available"])
 
 
 if __name__ == "__main__":
