@@ -1,26 +1,19 @@
 # LookAlign V0.1
 
-Current state of LookAlign: a local Python MVP for aligning a source image to a reference image and exporting the result.
+Architectural log for the current V0.1 pipeline.
 
-## Run
+## Core Flow
 
-```bash
-python3 app.py
-```
+1. `low-frequency transfer`
+   - Compare source and reference after broad blur.
+   - Transfer coarse color / lighting structure without chasing fine detail.
 
-## Inputs
+2. `trust map`
+   - Estimate where the reference is reliable enough to influence the fit.
+   - Downweight weak, noisy, or ambiguous regions.
 
-- `inputs/source.png`
-- `inputs/reference.png`
+3. `reconstruction`
+   - Rebuild the final image from local corrections and source detail.
+   - Apply anti-fade guards so the output keeps usable contrast and saturation.
 
-## Output
-
-- Generated runs are written to `outputs/`
-
-## Tests
-
-```bash
-python3 -m unittest
-```
-
-V0.1 is intentionally minimal. A much larger upgrade is next.
+V0.1 is a minimal log of this architecture. A much larger upgrade is next.
