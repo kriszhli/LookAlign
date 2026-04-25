@@ -155,6 +155,8 @@ def run_ui(
     return (
         build_comparison_html(paths, compare_a, compare_b, aspect_ratio),
         debug_paths.get("aligned_reference"),
+        debug_paths.get("source_lowfreq"),
+        debug_paths.get("reference_lowfreq"),
         debug_paths.get("trust_map"),
         debug_paths.get("overlap_mask"),
         result["output_path"],
@@ -382,6 +384,8 @@ def build_app() -> gr.Blocks:
 
         with gr.Row():
             aligned_reference = gr.Image(label="Aligned reference image", type="filepath")
+            source_lowfreq = gr.Image(label="Source low-frequency map", type="filepath")
+            reference_lowfreq = gr.Image(label="Reference low-frequency map", type="filepath")
             trust_map = gr.Image(label="Trust map", type="filepath")
             overlap_mask = gr.Image(label="Overlap mask", type="filepath")
 
@@ -408,6 +412,8 @@ def build_app() -> gr.Blocks:
             outputs=[
                 comparison,
                 aligned_reference,
+                source_lowfreq,
+                reference_lowfreq,
                 trust_map,
                 overlap_mask,
                 download,
