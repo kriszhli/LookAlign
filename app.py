@@ -96,11 +96,10 @@ def run_ui(
 def initial_paths() -> Dict[str, Optional[str]]:
     source = existing_path(DEFAULT_SOURCE)
     reference = existing_path(DEFAULT_REFERENCE)
-    output = existing_path(OUTPUTS_DIR / "output.png")
     return {
         "Source": source,
         "Reference": reference,
-        "LookAlign Output": output,
+        "LookAlign Output": None,
     }
 
 
@@ -215,7 +214,7 @@ def build_app() -> gr.Blocks:
                     compare_a = gr.Dropdown(IMAGE_OPTIONS, value="Source", label="Comparison A")
                     compare_b = gr.Dropdown(IMAGE_OPTIONS, value="LookAlign Output", label="Comparison B")
                 comparison = gr.ImageSlider(
-                    value=build_comparison_value(defaults, "Source", "LookAlign Output"),
+                    value=build_comparison_value(defaults, "Source", "Reference"),
                     type="filepath",
                     label="Before / after comparison",
                     interactive=False,
