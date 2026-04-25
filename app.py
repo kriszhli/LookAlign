@@ -3,13 +3,9 @@
 
 from __future__ import annotations
 
-import base64
-import html
-import mimetypes
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
-from uuid import uuid4
 
 import gradio as gr
 
@@ -36,74 +32,9 @@ def choose_input(path: Optional[str], default: Path, label: str) -> str:
     raise gr.Error(f"Please upload a {label} image.")
 
 
-def image_data_url(path: Optional[str]) -> Optional[str]:
-    if not path:
-        return None
-    p = Path(path)
-    if not p.exists():
-        return None
-    mime = mimetypes.guess_type(p.name)[0] or "image/png"
-    encoded = base64.b64encode(p.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def image_aspect_ratio(path: Optional[str]) -> float:
-    if not path:
-        return 4.0 / 3.0
-    p = Path(path)
-    if not p.exists():
-        return 4.0 / 3.0
-    try:
-        from PIL import Image
-
-        with Image.open(p) as img:
-            w, h = img.size
-        if w > 0 and h > 0:
-            return float(w) / float(h)
-    except Exception:
-        pass
-    return 4.0 / 3.0
-
-
-def build_comparison_html(paths: Dict[str, Optional[str]], left_name: str, right_name: str, aspect_ratio: float) -> str:
-    left_url = image_data_url(paths.get(left_name))
-    right_url = image_data_url(paths.get(right_name))
-    if not left_url or not right_url:
-        return (
-            '<div class="lookalign-empty">'
-            "Run LookAlign to compare Source, Reference, and LookAlign Output."
-            "</div>"
-        )
-
-    slider_id = f"lookalign-compare-{uuid4().hex}"
-    left_label = html.escape(left_name)
-    right_label = html.escape(right_name)
-    return f"""
-<div id="{slider_id}" class="lookalign-compare" style="--pos: 50%; --aspect: {aspect_ratio:.6f};">
-  <div class="lookalign-compare-stage">
-    <img class="lookalign-compare-img" src="{right_url}" alt="{right_label}">
-    <div class="lookalign-compare-before">
-      <img class="lookalign-compare-img" src="{left_url}" alt="{left_label}">
-    </div>
-    <div class="lookalign-compare-handle" aria-hidden="true"></div>
-    <div class="lookalign-compare-label lookalign-compare-left">{left_label}</div>
-    <div class="lookalign-compare-label lookalign-compare-right">{right_label}</div>
-    <input
-      class="lookalign-compare-range"
-      type="range"
-      min="0"
-      max="100"
-      value="50"
-      aria-label="Before after comparison slider"
-    >
-  </div>
-</div>
-"""
-
-
-def comparison_from_state(paths: Dict[str, Optional[str]], left_name: str, right_name: str) -> str:
+def build_comparison_value(paths: Dict[str, Optional[str]], left_name: str, right_name: str) -> tuple[Optional[str], Optional[str]]:
     paths = paths or {}
-    return build_comparison_html(paths, left_name, right_name, image_aspect_ratio(paths.get(left_name) or paths.get(right_name)))
+    return paths.get(left_name), paths.get(right_name)
 
 
 def run_ui(
@@ -150,15 +81,13 @@ def run_ui(
         "Reference": reference,
         "LookAlign Output": result["output_path"],
     }
-    aspect_ratio = image_aspect_ratio(source)
 
     return (
-        build_comparison_html(paths, compare_a, compare_b, aspect_ratio),
+        build_comparison_value(paths, compare_a, compare_b),
         debug_paths.get("aligned_reference"),
         debug_paths.get("source_lowfreq"),
         debug_paths.get("reference_lowfreq"),
         debug_paths.get("trust_map"),
-        debug_paths.get("overlap_mask"),
         result["output_path"],
         paths,
     )
@@ -173,101 +102,6 @@ def initial_paths() -> Dict[str, Optional[str]]:
         "Reference": reference,
         "LookAlign Output": output,
     }
-
-
-CSS = """
-.lookalign-compare-stage {
-  position: relative;
-  overflow: hidden;
-  width: 100%;
-  aspect-ratio: var(--aspect, 4 / 3);
-  max-height: 80vh;
-  background: #111827;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
-}
-.lookalign-compare-img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  background: #111827;
-}
-.lookalign-compare-before {
-  position: absolute;
-  inset: 0;
-  clip-path: inset(0 calc(100% - var(--pos)) 0 0);
-  border-right: 2px solid #ffffff;
-}
-.lookalign-compare-handle {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: var(--pos);
-  width: 2px;
-  background: #ffffff;
-  box-shadow: 0 0 0 1px rgba(0,0,0,0.25);
-}
-.lookalign-compare-handle::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 20px;
-  height: 20px;
-  transform: translate(-50%, -50%);
-  border: 2px solid #ffffff;
-  border-radius: 999px;
-  background: rgba(17, 24, 39, 0.7);
-}
-.lookalign-compare-range {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  cursor: ew-resize;
-}
-.lookalign-compare-label {
-  position: absolute;
-  top: 12px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  background: rgba(17, 24, 39, 0.72);
-  color: #ffffff;
-  font-size: 12px;
-  line-height: 1.2;
-  pointer-events: none;
-}
-.lookalign-compare-left {
-  left: 12px;
-}
-.lookalign-compare-right {
-  right: 12px;
-}
-.lookalign-empty {
-  padding: 18px;
-  border: 1px dashed #cbd5e1;
-  border-radius: 8px;
-  color: #475569;
-  background: #f8fafc;
-}
-"""
-
-COMPARISON_HEAD = """
-<script>
-document.addEventListener("input", function (event) {
-  const target = event.target;
-  if (!target || !target.classList || !target.classList.contains("lookalign-compare-range")) {
-    return;
-  }
-  const wrapper = target.closest(".lookalign-compare");
-  if (wrapper) {
-    wrapper.style.setProperty("--pos", target.value + "%");
-  }
-});
-</script>
-"""
 
 
 def build_app() -> gr.Blocks:
@@ -380,14 +214,19 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     compare_a = gr.Dropdown(IMAGE_OPTIONS, value="Source", label="Comparison A")
                     compare_b = gr.Dropdown(IMAGE_OPTIONS, value="LookAlign Output", label="Comparison B")
-                comparison = gr.HTML(value=build_comparison_html(defaults, "Source", "LookAlign Output", image_aspect_ratio(defaults["Source"])))
+                comparison = gr.ImageSlider(
+                    value=build_comparison_value(defaults, "Source", "LookAlign Output"),
+                    type="filepath",
+                    label="Before / after comparison",
+                    interactive=False,
+                    max_height=700,
+                )
 
         with gr.Row():
             aligned_reference = gr.Image(label="Aligned reference image", type="filepath")
             source_lowfreq = gr.Image(label="Source low-frequency map", type="filepath")
             reference_lowfreq = gr.Image(label="Reference low-frequency map", type="filepath")
             trust_map = gr.Image(label="Trust map", type="filepath")
-            overlap_mask = gr.Image(label="Overlap mask", type="filepath")
 
         download = gr.File(label="Download output PNG")
 
@@ -415,17 +254,16 @@ def build_app() -> gr.Blocks:
                 source_lowfreq,
                 reference_lowfreq,
                 trust_map,
-                overlap_mask,
                 download,
                 state,
             ],
             queue=False,
         )
-        compare_a.change(comparison_from_state, inputs=[state, compare_a, compare_b], outputs=comparison, queue=False)
-        compare_b.change(comparison_from_state, inputs=[state, compare_a, compare_b], outputs=comparison, queue=False)
+        compare_a.change(build_comparison_value, inputs=[state, compare_a, compare_b], outputs=comparison, queue=False)
+        compare_b.change(build_comparison_value, inputs=[state, compare_a, compare_b], outputs=comparison, queue=False)
 
     return demo
 
 
 if __name__ == "__main__":
-    build_app().launch(css=CSS, head=COMPARISON_HEAD)
+    build_app().launch()
