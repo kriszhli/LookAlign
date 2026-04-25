@@ -6,11 +6,11 @@ __pycache__/
 .ruff_cache/
 
 # Generated image outputs and local debug artifacts.
-output*.png
-output*.jpg
-output*.jpeg
-output*.tif
-output*.tiff
+/output*.png
+/output*.jpg
+/output*.jpeg
+/output*.tif
+/output*.tiff
 debug/
 debug*/
 
