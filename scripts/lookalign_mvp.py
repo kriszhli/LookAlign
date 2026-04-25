@@ -807,6 +807,17 @@ def write_debug(
         json.dump(data, f, indent=2, sort_keys=True)
 
 
+def normalize_debug_dir(debug_dir: Optional[str]) -> Optional[Path]:
+    if not debug_dir:
+        return None
+    d = Path(debug_dir)
+    if d.is_absolute():
+        return d
+    if d.parts and d.parts[0] == "outputs":
+        return d
+    return Path("outputs") / d
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deterministic low-frequency look transfer while preserving source detail.")
     parser.add_argument("--source", required=True, help="Source image path.")
@@ -846,6 +857,17 @@ def lookalign_defaults() -> Dict[str, Any]:
     }
 
 
+def normalize_cli_paths(output: str, debug_dir: Optional[str]) -> Tuple[str, Optional[str]]:
+    output_path = Path(output)
+    if output_path.parent.name != "outputs" or output_path.name != "output.png":
+        return str(output_path), debug_dir
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    run_dir = output_path.parent / run_id
+    resolved_output = run_dir / "lookalign_output.png"
+    resolved_debug = debug_dir if debug_dir is not None else str(run_dir / "debug")
+    return str(resolved_output), resolved_debug
+
+
 def _config_to_namespace(config: Optional[Dict[str, Any] | argparse.Namespace]) -> argparse.Namespace:
     values = lookalign_defaults()
     if config is not None:
@@ -866,6 +888,7 @@ def run_lookalign(
     args.source = str(source_path)
     args.reference = str(reference_path)
     args.output = str(output_path)
+    args.debug_dir = str(normalize_debug_dir(args.debug_dir)) if args.debug_dir else None
 
     warnings: List[str] = []
     src = load_rgb(args.source)
@@ -1012,6 +1035,7 @@ def run_lookalign(
 
 def main() -> int:
     args = parse_args()
+    args.output, args.debug_dir = normalize_cli_paths(args.output, args.debug_dir)
     result = run_lookalign(args.source, args.reference, args.output, args)
 
     if result["warnings"]:
