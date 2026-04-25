@@ -111,10 +111,14 @@ def run_ui(
     reference_path: Optional[str],
     align_mode: str,
     local_strength: float,
+    local_luma_strength: float,
     detail_strength: float,
     blur_sigma: float,
     grid: int,
     trust_threshold: float,
+    min_luma_std_ratio: float,
+    min_saturation_ratio: float,
+    anti_fade_strength: float,
     compare_a: str,
     compare_b: str,
 ) -> tuple[Any, ...]:
@@ -129,10 +133,14 @@ def run_ui(
         "debug_dir": str(debug_dir),
         "align": align_mode,
         "local_strength": float(local_strength),
+        "local_luma_strength": float(local_luma_strength),
         "detail_strength": float(detail_strength),
         "blur_sigma": float(blur_sigma),
         "grid": int(grid),
         "trust_threshold": float(trust_threshold),
+        "min_luma_std_ratio": float(min_luma_std_ratio),
+        "min_saturation_ratio": float(min_saturation_ratio),
+        "anti_fade_strength": float(anti_fade_strength),
     }
 
     result = run_lookalign(source, reference, output_path, config)
@@ -294,6 +302,14 @@ def build_app() -> gr.Blocks:
                 label="local_strength",
                 info="How strongly local color corrections are blended in.",
             )
+            local_luma_strength = gr.Slider(
+                0.0,
+                1.0,
+                value=0.25,
+                step=0.01,
+                label="local_luma_strength",
+                info="How strongly local corrections may change luminance.",
+            )
             detail_strength = gr.Slider(
                 0.0,
                 2.0,
@@ -329,6 +345,32 @@ def build_app() -> gr.Blocks:
                 info="Minimum alignment trust needed before pixels affect fitting.",
             )
 
+        with gr.Row():
+            min_luma_std_ratio = gr.Slider(
+                0.0,
+                1.25,
+                value=0.85,
+                step=0.01,
+                label="min_luma_std_ratio",
+                info="Minimum output/source luminance contrast ratio.",
+            )
+            min_saturation_ratio = gr.Slider(
+                0.0,
+                1.25,
+                value=0.80,
+                step=0.01,
+                label="min_saturation_ratio",
+                info="Minimum output/source saturation ratio.",
+            )
+            anti_fade_strength = gr.Slider(
+                0.0,
+                1.0,
+                value=1.0,
+                step=0.01,
+                label="anti_fade_strength",
+                info="Strength of final contrast and saturation guard.",
+            )
+
         run_button = gr.Button("Run LookAlign", variant="primary")
 
         with gr.Row():
@@ -352,10 +394,14 @@ def build_app() -> gr.Blocks:
                 reference_image,
                 align_mode,
                 local_strength,
+                local_luma_strength,
                 detail_strength,
                 blur_sigma,
                 grid,
                 trust_threshold,
+                min_luma_std_ratio,
+                min_saturation_ratio,
+                anti_fade_strength,
                 compare_a,
                 compare_b,
             ],

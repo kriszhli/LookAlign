@@ -412,14 +412,16 @@ def compute_trust(src: np.ndarray, ref: np.ndarray, overlap: np.ndarray) -> np.n
     slap = laplacian(src_l)
     rlap = laplacian(ref_l)
     lap_compat = np.exp(-np.abs(slap - rlap) / (np.abs(slap) + np.abs(rlap) + 0.035))
-    lum_compat = np.exp(-np.abs(mask_aware_blur(src_l, overlap, 8.0) - mask_aware_blur(ref_l, overlap, 8.0)) / 0.35)
-    corr = local_correlation(src_l, ref_l, overlap, 9.0)
+    src_hp = src_l - mask_aware_blur(src_l, overlap, 5.0)
+    ref_hp = ref_l - mask_aware_blur(ref_l, overlap, 5.0)
+    hp_corr = local_correlation(src_hp, ref_hp, overlap, 7.0)
+    lum_compat = np.exp(-np.abs(mask_aware_blur(src_l, overlap, 12.0) - mask_aware_blur(ref_l, overlap, 12.0)) / 0.50)
 
     edge_ref = float(np.percentile((smag + rmag)[overlap > 0.5], 95)) if np.any(overlap > 0.5) else 0.0
     edge_weight = np.clip((smag + rmag) / max(edge_ref, 0.03), 0.0, 1.0)
-    structural = 0.42 * orient + 0.33 * mag_compat + 0.25 * lap_compat
-    flat = 0.65 * lum_compat + 0.35 * corr
-    trust = ((1.0 - edge_weight) * flat + edge_weight * structural) * (0.70 + 0.30 * corr)
+    structural = 0.40 * orient + 0.28 * mag_compat + 0.22 * lap_compat + 0.10 * hp_corr
+    flat = 0.65 * hp_corr + 0.25 * structural + 0.10 * lum_compat
+    trust = ((1.0 - edge_weight) * flat + edge_weight * structural) * (0.88 + 0.12 * lum_compat)
     trust *= overlap
     trust = gaussian_blur(trust.astype(np.float32), 1.5)
     trust *= overlap
@@ -456,6 +458,72 @@ def weighted_mean_std(values: np.ndarray, weights: np.ndarray) -> Tuple[np.ndarr
     return mean.astype(np.float32), np.sqrt(np.maximum(var, EPS)).astype(np.float32)
 
 
+def weighted_quantiles(values: np.ndarray, weights: np.ndarray, quantiles: np.ndarray) -> np.ndarray:
+    v = values.reshape(-1).astype(np.float64)
+    w = weights.reshape(-1).astype(np.float64)
+    valid = np.isfinite(v) & np.isfinite(w) & (w > 0.0)
+    if int(valid.sum()) < 8:
+        finite = v[np.isfinite(v)]
+        if finite.size == 0:
+            return np.zeros_like(quantiles, dtype=np.float32)
+        return np.quantile(finite, quantiles).astype(np.float32)
+    v = v[valid]
+    w = w[valid]
+    order = np.argsort(v)
+    v = v[order]
+    w = w[order]
+    cdf = np.cumsum(w)
+    cdf /= max(float(cdf[-1]), EPS)
+    return np.interp(quantiles, cdf, v).astype(np.float32)
+
+
+def monotonic_targets(targets: np.ndarray) -> np.ndarray:
+    out = np.maximum.accumulate(targets.astype(np.float32))
+    if out.size > 1:
+        out = out + np.arange(out.size, dtype=np.float32) * 1e-5
+    return np.clip(out, 0.0, 1.0)
+
+
+def fit_luminance_tone_curve(src_l: np.ndarray, ref_l: np.ndarray, weights: np.ndarray, min_std_ratio: float) -> Dict[str, Any]:
+    qs = np.array([0.02, 0.08, 0.16, 0.30, 0.50, 0.70, 0.84, 0.92, 0.98], dtype=np.float32)
+    src_q = weighted_quantiles(src_l, weights, qs)
+    ref_q = weighted_quantiles(ref_l, weights, qs)
+    src_std = float(weighted_mean_std(src_l[..., None], weights)[1][0])
+    ref_std = float(weighted_mean_std(ref_l[..., None], weights)[1][0])
+    min_ratio = float(np.clip(min_std_ratio, 0.0, 1.0))
+    ref_q = monotonic_targets(ref_q)
+
+    if src_std > EPS and ref_std < src_std * min_ratio:
+        target_std = src_std * min_ratio
+        gain = np.clip(target_std / max(ref_std, 0.015), 1.0, 2.2)
+        median = float(ref_q[4])
+        ref_q = median + (ref_q - median) * gain
+        ref_q = ref_q * 0.82 + (median + (src_q - float(src_q[4])) * min_ratio) * 0.18
+        ref_q = monotonic_targets(ref_q)
+
+    if src_q[-1] - src_q[0] < 0.02:
+        src_q = np.linspace(0.0, 1.0, len(qs), dtype=np.float32)
+        ref_q = src_q.copy()
+
+    return {
+        "src_quantiles": src_q.astype(np.float32),
+        "ref_quantiles": ref_q.astype(np.float32),
+        "quantiles": qs,
+        "src_std": src_std,
+        "ref_std": ref_std,
+    }
+
+
+def apply_luminance_curve(luma: np.ndarray, curve: Dict[str, Any]) -> np.ndarray:
+    src_q = curve["src_quantiles"]
+    ref_q = curve["ref_quantiles"]
+    x = np.concatenate([[0.0], src_q, [1.0]]).astype(np.float32)
+    y = np.concatenate([[max(0.0, float(ref_q[0]) - float(src_q[0]))], ref_q, [min(1.0, float(ref_q[-1]) + 1.0 - float(src_q[-1]))]]).astype(np.float32)
+    x, keep = np.unique(x, return_index=True)
+    y = y[keep]
+    return np.interp(luma.reshape(-1), x, y).reshape(luma.shape).astype(np.float32)
+
+
 def global_color_transfer(
     src_canvas: np.ndarray,
     ref_canvas: np.ndarray,
@@ -463,6 +531,7 @@ def global_color_transfer(
     weights: np.ndarray,
     blur_sigma: float,
     mean_trust: float,
+    min_luma_std_ratio: float,
     warnings: List[str],
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     src_low = mask_aware_blur(src_canvas, source_mask, blur_sigma)
@@ -480,31 +549,44 @@ def global_color_transfer(
             "ref_mean": [0.0, 0.0, 0.0],
             "scale": [1.0, 1.0, 1.0],
             "offset": [0.0, 0.0, 0.0],
+            "luma_curve": None,
         }
         return src_canvas.copy(), params
 
-    src_mean, src_std = weighted_mean_std(src_fit, weights)
-    ref_mean, ref_std = weighted_mean_std(ref_fit, weights)
-    scale = np.clip(ref_std / np.maximum(src_std, 0.015), 0.55, 1.85)
-    offset = ref_mean - src_mean * scale
-    offset = np.clip(offset, -0.22, 0.22)
+    luma_curve = fit_luminance_tone_curve(src_fit[..., 0], ref_fit[..., 0], weights, min_luma_std_ratio)
+    src_mean_ab, src_std_ab = weighted_mean_std(src_fit[..., 1:3], weights)
+    ref_mean_ab, ref_std_ab = weighted_mean_std(ref_fit[..., 1:3], weights)
+    scale_ab = np.clip(ref_std_ab / np.maximum(src_std_ab, 0.012), 0.65, 1.55)
+    offset_ab = np.clip(ref_mean_ab - src_mean_ab * scale_ab, -0.16, 0.16)
     strength = 1.0 if mean_trust >= 0.22 else float(np.clip(0.35 + mean_trust, 0.25, 0.65))
 
     src_full, _ = rgb_to_lab(src_canvas)
-    transformed = src_full * scale.reshape(1, 1, 3) + offset.reshape(1, 1, 3)
-    transformed = src_full * (1.0 - strength) + transformed * strength
+    transformed = src_full.copy()
+    mapped_l = apply_luminance_curve(src_full[..., 0], luma_curve)
+    tone_strength = float(np.clip(0.70 + 0.25 * strength, 0.55, 0.95))
+    transformed[..., 0] = src_full[..., 0] * (1.0 - tone_strength) + mapped_l * tone_strength
+    chroma = src_full[..., 1:3] * scale_ab.reshape(1, 1, 2) + offset_ab.reshape(1, 1, 2)
+    transformed[..., 1:3] = src_full[..., 1:3] * (1.0 - strength) + chroma * strength
     result = lab_to_rgb(transformed, space)
     result = result * source_mask[..., None] + src_canvas * (1.0 - source_mask[..., None])
     params = {
         "space": space,
         "enabled": True,
         "strength": strength,
-        "src_mean": src_mean.tolist(),
-        "ref_mean": ref_mean.tolist(),
-        "src_std": src_std.tolist(),
-        "ref_std": ref_std.tolist(),
-        "scale": scale.tolist(),
-        "offset": offset.tolist(),
+        "tone_strength": tone_strength,
+        "src_chroma_mean": src_mean_ab.tolist(),
+        "ref_chroma_mean": ref_mean_ab.tolist(),
+        "src_chroma_std": src_std_ab.tolist(),
+        "ref_chroma_std": ref_std_ab.tolist(),
+        "chroma_scale": scale_ab.tolist(),
+        "chroma_offset": offset_ab.tolist(),
+        "luma_curve": {
+            "quantiles": luma_curve["quantiles"].tolist(),
+            "src_quantiles": luma_curve["src_quantiles"].tolist(),
+            "ref_quantiles": luma_curve["ref_quantiles"].tolist(),
+            "src_std": luma_curve["src_std"],
+            "ref_std": luma_curve["ref_std"],
+        },
     }
     return finite01(result), params
 
@@ -516,6 +598,7 @@ def compute_local_field(
     trusted_weights: np.ndarray,
     grid: int,
     blur_sigma: float,
+    local_luma_strength: float,
     warnings: List[str],
 ) -> Tuple[np.ndarray, np.ndarray, bool]:
     h, w = source_mask.shape
@@ -525,7 +608,11 @@ def compute_local_field(
 
     global_low = mask_aware_blur(global_result, source_mask, blur_sigma)
     ref_low = mask_aware_blur(ref_canvas, (trusted_weights > 0).astype(np.float32), blur_sigma)
-    delta = np.clip(ref_low - global_low, -0.22, 0.22)
+    global_fit, space = rgb_to_lab(global_low)
+    ref_fit, _ = rgb_to_lab(ref_low)
+    delta = ref_fit - global_fit
+    delta[..., 0] = np.clip(delta[..., 0] * float(np.clip(local_luma_strength, 0.0, 1.0)), -0.06, 0.06)
+    delta[..., 1:3] = np.clip(delta[..., 1:3], -0.14, 0.14)
     gy = max(2, int(grid))
     gx = max(2, int(round(grid * w / max(h, 1))))
     field_grid = np.zeros((gy, gx, 3), dtype=np.float32)
@@ -575,10 +662,14 @@ def compute_local_field(
     edge = np.sqrt(sx * sx + sy * sy)
     edge_ref = float(np.percentile(edge[source_mask > 0.5], 95)) if np.any(source_mask > 0.5) else 0.0
     edge_gate = 1.0 - 0.55 * np.clip(edge / max(edge_ref, 0.03), 0.0, 1.0)
-    field = np.clip(field * edge_gate[..., None] * source_mask[..., None], -0.18, 0.18)
-    local_result = finite01(global_result + field)
+    field = field * edge_gate[..., None] * source_mask[..., None]
+    field[..., 0] = np.clip(field[..., 0], -0.06, 0.06)
+    field[..., 1:3] = np.clip(field[..., 1:3], -0.14, 0.14)
+    global_full, _ = rgb_to_lab(global_result)
+    local_result = lab_to_rgb(global_full + field, space)
     local_result = local_result * source_mask[..., None] + global_result * (1.0 - source_mask[..., None])
-    return field, local_result, True
+    rgb_field = local_result - global_result
+    return rgb_field.astype(np.float32), finite01(local_result), True
 
 
 def apply_detail_preservation(src: np.ndarray, transferred: np.ndarray, mask: np.ndarray, blur_sigma: float, detail_strength: float) -> np.ndarray:
@@ -587,9 +678,11 @@ def apply_detail_preservation(src: np.ndarray, transferred: np.ndarray, mask: np
     detail_sigma = max(1.0, blur_sigma * 0.33)
     src_base = mask_aware_blur(src_l, mask, detail_sigma)
     tr_base = mask_aware_blur(tr_l, mask, detail_sigma)
-    source_detail = np.clip(src_l - src_base, -0.35, 0.35)
-    final_l = np.clip(tr_base + float(detail_strength) * source_detail, 0.0, 1.0)
-    ratio = np.clip((final_l + 0.015) / (tr_l + 0.015), 0.45, 1.75)
+    source_detail_ratio = np.clip((src_l + 0.025) / (src_base + 0.025), 0.55, 1.80)
+    detail_ratio = 1.0 + float(detail_strength) * (source_detail_ratio - 1.0)
+    detail_ratio = np.clip(detail_ratio, 0.45, 2.10)
+    final_l = np.clip(tr_base * detail_ratio, 0.0, 1.0)
+    ratio = np.clip((final_l + 0.015) / (tr_l + 0.015), 0.40, 2.00)
     out = transferred * ratio[..., None]
     return finite01(out * mask[..., None] + transferred * (1.0 - mask[..., None]))
 
@@ -617,6 +710,77 @@ def protect_output(src: np.ndarray, out: np.ndarray, mask: np.ndarray) -> np.nda
     scale = np.minimum(1.0, cap / np.maximum(sat, EPS))
     out = gray + chroma * scale[..., None]
     return finite01(out * mask[..., None] + src * (1.0 - mask[..., None]))
+
+
+def masked_std(values: np.ndarray, mask: np.ndarray) -> float:
+    vals = values[mask > 0.5].astype(np.float64)
+    if vals.size == 0:
+        return 0.0
+    return float(vals.std())
+
+
+def masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
+    vals = values[mask > 0.5].astype(np.float64)
+    if vals.size == 0:
+        return 0.0
+    return float(vals.mean())
+
+
+def anti_fade_guard(
+    src: np.ndarray,
+    out: np.ndarray,
+    mask: np.ndarray,
+    min_luma_std_ratio: float,
+    min_saturation_ratio: float,
+    strength: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    guard_strength = float(np.clip(strength, 0.0, 1.0))
+    src_l = luminance(src)
+    out_l = luminance(out)
+    src_l_std = masked_std(src_l, mask)
+    out_l_std = masked_std(out_l, mask)
+    target_l_std = src_l_std * float(max(0.0, min_luma_std_ratio)) * 1.02
+    luma_boost = 1.0
+    guarded = out.copy()
+    if guard_strength > 0.0 and src_l_std > EPS and out_l_std + EPS < target_l_std:
+        luma_boost = float(np.clip(target_l_std / max(out_l_std, 0.01), 1.0, 1.75))
+        mean_l = masked_mean(out_l, mask)
+        restored_l = np.clip(mean_l + (out_l - mean_l) * luma_boost, 0.0, 1.0)
+        restored_l = out_l * (1.0 - guard_strength) + restored_l * guard_strength
+        ratio = np.clip((restored_l + 0.015) / (out_l + 0.015), 0.50, 1.90)
+        guarded = finite01(guarded * ratio[..., None])
+
+    src_sat = src.max(axis=-1) - src.min(axis=-1)
+    guarded_l = luminance(guarded)
+    guarded_sat = guarded.max(axis=-1) - guarded.min(axis=-1)
+    src_sat_mean = masked_mean(src_sat, mask)
+    out_sat_mean = masked_mean(guarded_sat, mask)
+    target_sat = src_sat_mean * float(max(0.0, min_saturation_ratio))
+    sat_boost = 1.0
+    if guard_strength > 0.0 and src_sat_mean > EPS and out_sat_mean + EPS < target_sat:
+        sat_boost = float(np.clip(target_sat / max(out_sat_mean, 0.01), 1.0, 1.85))
+        gray = np.repeat(guarded_l[..., None], 3, axis=-1)
+        chroma = guarded - gray
+        boosted = finite01(gray + chroma * sat_boost)
+        guarded = guarded * (1.0 - guard_strength) + boosted * guard_strength
+
+    guarded = finite01(guarded * mask[..., None] + src * (1.0 - mask[..., None]))
+    final_l = luminance(guarded)
+    final_sat = guarded.max(axis=-1) - guarded.min(axis=-1)
+    metrics = {
+        "strength": guard_strength,
+        "min_luma_std_ratio": float(min_luma_std_ratio),
+        "min_saturation_ratio": float(min_saturation_ratio),
+        "source_luma_std": src_l_std,
+        "pre_guard_luma_std": out_l_std,
+        "post_guard_luma_std": masked_std(final_l, mask),
+        "source_saturation_mean": src_sat_mean,
+        "pre_guard_saturation_mean": out_sat_mean,
+        "post_guard_saturation_mean": masked_mean(final_sat, mask),
+        "luma_boost": luma_boost,
+        "saturation_boost": sat_boost,
+    }
+    return guarded, metrics
 
 
 def crop_source(canvas: np.ndarray, offset: Tuple[int, int], src_shape: Tuple[int, int, int]) -> np.ndarray:
@@ -655,8 +819,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid", type=int, default=16, help="Approximate local correction grid rows.")
     parser.add_argument("--blur-sigma", type=float, default=24.0, help="Low-frequency Gaussian sigma.")
     parser.add_argument("--local-strength", type=float, default=0.65, help="Local correction blend strength.")
+    parser.add_argument("--local-luma-strength", type=float, default=0.25, help="Strength for local luminance correction; chroma local correction is unaffected.")
     parser.add_argument("--detail-strength", type=float, default=1.0, help="Source detail restoration strength.")
     parser.add_argument("--trust-threshold", type=float, default=0.15, help="Minimum trust used for fitting.")
+    parser.add_argument("--min-luma-std-ratio", type=float, default=0.85, help="Minimum output/source luminance std ratio enforced by anti-fade guard.")
+    parser.add_argument("--min-saturation-ratio", type=float, default=0.80, help="Minimum output/source saturation ratio enforced by anti-fade guard.")
+    parser.add_argument("--anti-fade-strength", type=float, default=1.0, help="Strength for final contrast and saturation anti-fade guard.")
     return parser.parse_args()
 
 
@@ -669,8 +837,12 @@ def lookalign_defaults() -> Dict[str, Any]:
         "grid": 16,
         "blur_sigma": 24.0,
         "local_strength": 0.65,
+        "local_luma_strength": 0.25,
         "detail_strength": 1.0,
         "trust_threshold": 0.15,
+        "min_luma_std_ratio": 0.85,
+        "min_saturation_ratio": 0.80,
+        "anti_fade_strength": 1.0,
     }
 
 
@@ -741,6 +913,7 @@ def run_lookalign(
         fit_weights,
         args.blur_sigma,
         mean_trust,
+        args.min_luma_std_ratio,
         warnings,
     )
 
@@ -751,6 +924,7 @@ def run_lookalign(
         fit_weights,
         args.grid,
         args.blur_sigma,
+        args.local_luma_strength,
         warnings,
     )
     local_result = finite01(global_result * (1.0 - local_strength) + local_unblended * local_strength)
@@ -759,7 +933,15 @@ def run_lookalign(
 
     detailed = apply_detail_preservation(source_canvas, local_result, source_mask, args.blur_sigma, args.detail_strength)
     protected = protect_output(source_canvas, detailed, source_mask)
-    output = crop_source(protected, offset, src.shape)
+    guarded, guard_metrics = anti_fade_guard(
+        source_canvas,
+        protected,
+        source_mask,
+        args.min_luma_std_ratio,
+        args.min_saturation_ratio,
+        args.anti_fade_strength,
+    )
+    output = crop_source(guarded, offset, src.shape)
     output = finite01(output)
     save_rgb(args.output, output)
 
@@ -778,6 +960,8 @@ def run_lookalign(
         "trusted_pixel_count": trusted_count,
         "global_fit_parameters": global_params,
         "local_strength_used": float(local_strength if local_enabled else 0.0),
+        "local_luma_strength": float(args.local_luma_strength),
+        "anti_fade_guard": guard_metrics,
         "warnings": warnings,
     }
     write_debug(
