@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import gradio as gr
 
@@ -31,7 +31,7 @@ def choose_input(path: Optional[str], default: Path, label: str) -> str:
     raise gr.Error(f"Please upload a {label} image.")
 
 
-def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> str:
+def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[str, ...]:
     source = choose_input(source_path, DEFAULT_SOURCE, "source")
     reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
     run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -51,7 +51,23 @@ def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> str:
         global_metrics=global_metrics,
         config=LocalMatchingConfig(),
     )
-    return metrics["paths"]["final_output"]
+    paths = metrics["paths"]
+    return (
+        paths["final_output"],
+        paths["diffuse_luma_delta"],
+        paths["diffuse_hue_delta"],
+        paths["diffuse_chroma_scale"],
+        paths["diffuse_confidence"],
+        paths["diffuse_residual_rejection"],
+        paths["ref_residual_confidence"],
+        paths["specular_confidence"],
+        paths["shadow_confidence"],
+        paths["hue_stability_confidence"],
+        paths["delta_sanity_confidence"],
+        paths["luma_confidence"],
+        paths["hue_confidence"],
+        paths["chroma_confidence"],
+    )
 
 
 def build_app() -> gr.Blocks:
@@ -66,10 +82,45 @@ def build_app() -> gr.Blocks:
 
         final_output = gr.Image(label="Final output", type="filepath")
 
+        gr.Markdown("## Local matching debug maps")
+        with gr.Row():
+            diffuse_luma_delta = gr.Image(label="Diffuse luma delta", type="filepath")
+            diffuse_hue_delta = gr.Image(label="Diffuse hue delta", type="filepath")
+            diffuse_chroma_scale = gr.Image(label="Diffuse chroma scale", type="filepath")
+        with gr.Row():
+            diffuse_confidence = gr.Image(label="Diffuse confidence", type="filepath")
+            diffuse_residual_rejection = gr.Image(label="Diffuse residual rejection", type="filepath")
+        with gr.Row():
+            ref_residual_confidence = gr.Image(label="Reference residual confidence", type="filepath")
+            specular_confidence = gr.Image(label="Specular confidence", type="filepath")
+            shadow_confidence = gr.Image(label="Shadow confidence", type="filepath")
+        with gr.Row():
+            hue_stability_confidence = gr.Image(label="Hue stability confidence", type="filepath")
+            delta_sanity_confidence = gr.Image(label="Delta sanity confidence", type="filepath")
+        with gr.Row():
+            luma_confidence = gr.Image(label="Luma confidence", type="filepath")
+            hue_confidence = gr.Image(label="Hue confidence", type="filepath")
+            chroma_confidence = gr.Image(label="Chroma confidence", type="filepath")
+
         run_button.click(
             fn=run_ui,
             inputs=[source_image, reference_image],
-            outputs=final_output,
+            outputs=[
+                final_output,
+                diffuse_luma_delta,
+                diffuse_hue_delta,
+                diffuse_chroma_scale,
+                diffuse_confidence,
+                diffuse_residual_rejection,
+                ref_residual_confidence,
+                specular_confidence,
+                shadow_confidence,
+                hue_stability_confidence,
+                delta_sanity_confidence,
+                luma_confidence,
+                hue_confidence,
+                chroma_confidence,
+            ],
             queue=True,
         )
 

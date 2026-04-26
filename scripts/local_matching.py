@@ -36,14 +36,16 @@ class LocalMatchingConfig:
     max_diffuse_hue_delta: float = 0.35
     min_diffuse_chroma_scale: float = 0.80
     max_diffuse_chroma_scale: float = 1.25
-    residual_low: float = 0.035
-    residual_high: float = 0.115
-    texture_low: float = 0.018
-    texture_high: float = 0.070
-    low_chroma_start: float = 0.018
-    low_chroma_end: float = 0.055
+    low_chroma_start: float = 0.006
+    low_chroma_end: float = 0.025
     clipped_start: float = 0.965
     clipped_end: float = 0.995
+    shadow_start: float = 0.020
+    shadow_end: float = 0.120
+    delta_sanity_luma: float = 0.180
+    delta_sanity_hue: float = 0.700
+    delta_sanity_chroma_scale: float = 0.600
+    confidence_blur_passes: int = 6
 
 
 def smoothstep(edge0: float, edge1: float, x: Tensor) -> Tensor:
@@ -96,19 +98,48 @@ def gray_visual(x: Tensor) -> np.ndarray:
     return x.clamp(0.0, 1.0).detach().cpu().numpy()[0, 0].astype(np.float32)
 
 
-def local_texture_energy(lab: Tensor) -> Tensor:
-    local_mean = F.avg_pool2d(lab, kernel_size=3, stride=1, padding=1)
-    return (lab - local_mean).norm(dim=1, keepdim=True)
+def percentile_threshold(x: Tensor, q: float) -> Tensor:
+    return torch.quantile(x.flatten(), float(q) / 100.0)
 
 
-def clipped_highlight_rejection(rgb: Tensor, cfg: LocalMatchingConfig) -> Tensor:
-    max_rgb = rgb.max(dim=1, keepdim=True).values
-    sat_channels = (rgb > float(cfg.clipped_start)).float().mean(dim=1, keepdim=True)
-    bright_reject = smoothstep(cfg.clipped_start, cfg.clipped_end, max_rgb)
-    return (bright_reject * sat_channels).clamp(0.0, 1.0)
+def smooth_confidence_from_range(x: Tensor, low: Tensor | float, high: Tensor | float) -> Tensor:
+    low_t = torch.as_tensor(low, device=x.device, dtype=x.dtype)
+    high_t = torch.as_tensor(high, device=x.device, dtype=x.dtype)
+    t = ((x - low_t) / (high_t - low_t).clamp_min(1e-6)).clamp(0.0, 1.0)
+    return (1.0 - (t * t * (3.0 - 2.0 * t))).clamp(0.0, 1.0)
 
 
-def residual_rejection(
+def smooth_confidence_map(confidence: Tensor, cfg: LocalMatchingConfig) -> Tensor:
+    _, _, height, width = confidence.shape
+    x = resize_long_edge_unclamped(confidence, cfg.diffuse_proxy_long_edge)
+    for _ in range(max(1, int(cfg.confidence_blur_passes))):
+        x = F.avg_pool2d(F.pad(x, (3, 3, 3, 3), mode="replicate"), kernel_size=7, stride=1)
+    return resize_to_hw_unclamped(x, height, width).clamp(0.0, 1.0)
+
+
+def reference_specular_confidence(ref_lab: Tensor, ref_rgb: Tensor, cfg: LocalMatchingConfig) -> Tensor:
+    ref_chroma, _ = chroma_and_hue(ref_lab)
+    max_rgb = ref_rgb.max(dim=1, keepdim=True).values
+    min_rgb = ref_rgb.min(dim=1, keepdim=True).values
+    saturation = (max_rgb - min_rgb) / max_rgb.clamp_min(1e-4)
+    bright = smoothstep(cfg.clipped_start, cfg.clipped_end, max_rgb)
+    low_saturation = 1.0 - smoothstep(0.08, 0.22, saturation)
+    low_chroma = 1.0 - smoothstep(0.015, 0.050, ref_chroma)
+    specular = (bright * torch.maximum(low_saturation, low_chroma)).clamp(0.0, 1.0)
+    return 1.0 - specular
+
+
+def shadow_confidence(ref_proxy: Tensor, cfg: LocalMatchingConfig) -> Tensor:
+    return smoothstep(cfg.shadow_start, cfg.shadow_end, ref_proxy[:, 0:1])
+
+
+def hue_stability_confidence(base_proxy: Tensor, ref_proxy: Tensor, cfg: LocalMatchingConfig) -> Tensor:
+    base_chroma, _ = chroma_and_hue(base_proxy)
+    ref_chroma, _ = chroma_and_hue(ref_proxy)
+    return smoothstep(cfg.low_chroma_start, cfg.low_chroma_end, torch.minimum(base_chroma, ref_chroma))
+
+
+def confidence_maps(
     base_lab: Tensor,
     base_proxy: Tensor,
     ref_lab: Tensor,
@@ -116,30 +147,65 @@ def residual_rejection(
     base_rgb: Tensor,
     ref_rgb: Tensor,
     cfg: LocalMatchingConfig,
-) -> Tensor:
-    base_residual = (base_lab - base_proxy).norm(dim=1, keepdim=True)
+) -> Dict[str, Tensor]:
     ref_residual = (ref_lab - ref_proxy).norm(dim=1, keepdim=True)
-    residual = torch.maximum(base_residual, ref_residual)
-    residual_reject = smoothstep(cfg.residual_low, cfg.residual_high, residual)
+    residual_low = percentile_threshold(ref_residual, 65.0)
+    residual_high = torch.maximum(percentile_threshold(ref_residual, 92.0), residual_low + 1e-4)
+    ref_residual_confidence = smooth_confidence_from_range(ref_residual, residual_low, residual_high)
+    specular_conf = reference_specular_confidence(ref_lab, ref_rgb, cfg)
+    shadow_conf = shadow_confidence(ref_proxy, cfg)
+    hue_stability_conf = hue_stability_confidence(base_proxy, ref_proxy, cfg)
 
-    texture = torch.maximum(local_texture_energy(base_lab), local_texture_energy(ref_lab))
-    texture_reject = smoothstep(cfg.texture_low, cfg.texture_high, texture)
-
-    clipped = torch.maximum(clipped_highlight_rejection(base_rgb, cfg), clipped_highlight_rejection(ref_rgb, cfg))
-
+    raw_luma_delta = (ref_proxy[:, 0:1] - base_proxy[:, 0:1]).abs()
     base_proxy_chroma, _ = chroma_and_hue(base_proxy)
-    ref_proxy_chroma, _ = chroma_and_hue(ref_proxy)
-    min_chroma = torch.minimum(base_proxy_chroma, ref_proxy_chroma)
-    unstable_hue = 1.0 - smoothstep(cfg.low_chroma_start, cfg.low_chroma_end, min_chroma)
+    ref_proxy_chroma, ref_proxy_hue = chroma_and_hue(ref_proxy)
+    _, base_proxy_hue = chroma_and_hue(base_proxy)
+    raw_hue_delta = shortest_angle_delta(ref_proxy_hue, base_proxy_hue).abs()
+    raw_chroma_delta = ((ref_proxy_chroma / base_proxy_chroma) - 1.0).abs()
 
-    return torch.maximum(torch.maximum(residual_reject, texture_reject), torch.maximum(clipped, unstable_hue)).clamp(0.0, 1.0)
+    delta_sanity_luma = smooth_confidence_from_range(raw_luma_delta, cfg.max_diffuse_luma_delta, cfg.delta_sanity_luma)
+    delta_sanity_hue = smooth_confidence_from_range(raw_hue_delta, cfg.max_diffuse_hue_delta, cfg.delta_sanity_hue)
+    delta_sanity_chroma = smooth_confidence_from_range(
+        raw_chroma_delta,
+        max(1.0 - cfg.min_diffuse_chroma_scale, cfg.max_diffuse_chroma_scale - 1.0),
+        cfg.delta_sanity_chroma_scale,
+    )
+    delta_sanity_conf = torch.minimum(delta_sanity_luma, torch.minimum(delta_sanity_hue, delta_sanity_chroma))
+
+    luma_confidence = ref_residual_confidence * specular_conf * shadow_conf * delta_sanity_luma
+    hue_confidence = luma_confidence * hue_stability_conf * delta_sanity_hue
+    chroma_confidence = luma_confidence * hue_stability_conf * specular_conf * delta_sanity_chroma
+
+    ref_residual_confidence = smooth_confidence_map(ref_residual_confidence, cfg)
+    specular_conf = smooth_confidence_map(specular_conf, cfg)
+    shadow_conf = smooth_confidence_map(shadow_conf, cfg)
+    hue_stability_conf = smooth_confidence_map(hue_stability_conf, cfg)
+    delta_sanity_conf = smooth_confidence_map(delta_sanity_conf, cfg)
+    luma_confidence = smooth_confidence_map(luma_confidence, cfg)
+    hue_confidence = smooth_confidence_map(hue_confidence, cfg)
+    chroma_confidence = smooth_confidence_map(chroma_confidence, cfg)
+
+    return {
+        "ref_residual_confidence": ref_residual_confidence,
+        "specular_confidence": specular_conf,
+        "shadow_confidence": shadow_conf,
+        "hue_stability_confidence": hue_stability_conf,
+        "delta_sanity_confidence": delta_sanity_conf,
+        "luma_confidence": luma_confidence,
+        "hue_confidence": hue_confidence,
+        "chroma_confidence": chroma_confidence,
+        "combined_confidence": torch.maximum(luma_confidence, torch.maximum(hue_confidence, chroma_confidence)),
+        "ref_residual_rejection": 1.0 - ref_residual_confidence,
+    }
 
 
 def apply_local_maps(
     base_lab: Tensor,
     base_proxy: Tensor,
     ref_proxy: Tensor,
-    confidence: Tensor,
+    luma_confidence: Tensor,
+    hue_confidence: Tensor,
+    chroma_confidence: Tensor,
     cfg: LocalMatchingConfig,
 ) -> tuple[Tensor, Dict[str, Tensor]]:
     base_chroma, base_hue = chroma_and_hue(base_proxy)
@@ -156,9 +222,9 @@ def apply_local_maps(
     )
 
     source_chroma, source_hue = chroma_and_hue(base_lab)
-    final_l = (base_lab[:, 0:1] + confidence * luma_delta).clamp(0.0, 1.0)
-    final_hue = source_hue + confidence * hue_delta
-    final_chroma = source_chroma * (1.0 + confidence * (chroma_scale - 1.0))
+    final_l = (base_lab[:, 0:1] + luma_confidence * luma_delta).clamp(0.0, 1.0)
+    final_hue = source_hue + hue_confidence * hue_delta
+    final_chroma = source_chroma * (1.0 + chroma_confidence * (chroma_scale - 1.0))
     final_ab = torch.cat((torch.cos(final_hue), torch.sin(final_hue)), dim=1) * final_chroma
     final_lab = torch.cat((final_l, final_ab), dim=1)
 
@@ -166,7 +232,10 @@ def apply_local_maps(
         "luma_delta": luma_delta,
         "hue_delta": hue_delta,
         "chroma_scale": chroma_scale,
-        "confidence": confidence,
+        "confidence": torch.maximum(luma_confidence, torch.maximum(hue_confidence, chroma_confidence)),
+        "luma_confidence": luma_confidence,
+        "hue_confidence": hue_confidence,
+        "chroma_confidence": chroma_confidence,
     }
     return final_lab, maps
 
@@ -193,7 +262,7 @@ def run_local_diffuse_matching(
     timings["diffuse_proxy"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    rejection = residual_rejection(
+    confidence = confidence_maps(
         base_intermediate_lab,
         base_proxy,
         reference_resized_lab,
@@ -202,8 +271,15 @@ def run_local_diffuse_matching(
         reference_resized_rgb,
         cfg,
     )
-    confidence = 1.0 - rejection
-    final_lab, maps = apply_local_maps(base_intermediate_lab, base_proxy, ref_proxy, confidence, cfg)
+    final_lab, maps = apply_local_maps(
+        base_intermediate_lab,
+        base_proxy,
+        ref_proxy,
+        confidence["luma_confidence"],
+        confidence["hue_confidence"],
+        confidence["chroma_confidence"],
+        cfg,
+    )
     final_rgb = soft_gamut_compress(oklab_to_rgb(final_lab))
     timings["local_apply"] = time.perf_counter() - t1
 
@@ -215,6 +291,14 @@ def run_local_diffuse_matching(
             "diffuse_chroma_scale": str(output_dir / "diffuse_chroma_scale.png"),
             "diffuse_confidence": str(output_dir / "diffuse_confidence.png"),
             "diffuse_residual_rejection": str(output_dir / "diffuse_residual_rejection.png"),
+            "ref_residual_confidence": str(output_dir / "ref_residual_confidence.png"),
+            "specular_confidence": str(output_dir / "specular_confidence.png"),
+            "shadow_confidence": str(output_dir / "shadow_confidence.png"),
+            "hue_stability_confidence": str(output_dir / "hue_stability_confidence.png"),
+            "delta_sanity_confidence": str(output_dir / "delta_sanity_confidence.png"),
+            "luma_confidence": str(output_dir / "luma_confidence.png"),
+            "hue_confidence": str(output_dir / "hue_confidence.png"),
+            "chroma_confidence": str(output_dir / "chroma_confidence.png"),
             "final_output": str(output_dir / "final_output.png"),
         }
     )
@@ -227,7 +311,15 @@ def run_local_diffuse_matching(
         range_map_visual(maps["chroma_scale"], cfg.min_diffuse_chroma_scale, cfg.max_diffuse_chroma_scale),
     )
     save_gray(paths["diffuse_confidence"], gray_visual(maps["confidence"]))
-    save_gray(paths["diffuse_residual_rejection"], gray_visual(rejection))
+    save_gray(paths["diffuse_residual_rejection"], gray_visual(confidence["ref_residual_rejection"]))
+    save_gray(paths["ref_residual_confidence"], gray_visual(confidence["ref_residual_confidence"]))
+    save_gray(paths["specular_confidence"], gray_visual(confidence["specular_confidence"]))
+    save_gray(paths["shadow_confidence"], gray_visual(confidence["shadow_confidence"]))
+    save_gray(paths["hue_stability_confidence"], gray_visual(confidence["hue_stability_confidence"]))
+    save_gray(paths["delta_sanity_confidence"], gray_visual(confidence["delta_sanity_confidence"]))
+    save_gray(paths["luma_confidence"], gray_visual(confidence["luma_confidence"]))
+    save_gray(paths["hue_confidence"], gray_visual(confidence["hue_confidence"]))
+    save_gray(paths["chroma_confidence"], gray_visual(confidence["chroma_confidence"]))
     save_rgb(paths["final_output"], to_hwc_np(final_rgb))
     timings["local_debug_saves"] = time.perf_counter() - t2
 
@@ -239,8 +331,16 @@ def run_local_diffuse_matching(
         "local_config": asdict(cfg),
         "global_timings": serial_global.get("timings", {}),
         "local_timings": timings,
-        "mean_local_confidence": float(confidence.mean().detach().cpu()),
-        "mean_local_residual_rejection": float(rejection.mean().detach().cpu()),
+        "mean_local_confidence": float(maps["confidence"].mean().detach().cpu()),
+        "mean_ref_residual_confidence": float(confidence["ref_residual_confidence"].mean().detach().cpu()),
+        "mean_specular_confidence": float(confidence["specular_confidence"].mean().detach().cpu()),
+        "mean_shadow_confidence": float(confidence["shadow_confidence"].mean().detach().cpu()),
+        "mean_hue_stability_confidence": float(confidence["hue_stability_confidence"].mean().detach().cpu()),
+        "mean_delta_sanity_confidence": float(confidence["delta_sanity_confidence"].mean().detach().cpu()),
+        "mean_local_luma_confidence": float(confidence["luma_confidence"].mean().detach().cpu()),
+        "mean_local_hue_confidence": float(confidence["hue_confidence"].mean().detach().cpu()),
+        "mean_local_chroma_confidence": float(confidence["chroma_confidence"].mean().detach().cpu()),
+        "mean_local_residual_rejection": float(confidence["ref_residual_rejection"].mean().detach().cpu()),
         "final_output_stats": image_stats_from_lab(source_lab, final_lab, final_rgb),
         "paths": paths,
     }
