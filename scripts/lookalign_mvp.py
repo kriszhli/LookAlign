@@ -57,7 +57,13 @@ def load_rgb(path: str) -> np.ndarray:
 def save_rgb(path: str | Path, img: np.ndarray) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    out = (finite01(img) * 255.0 + 0.5).astype(np.uint8)
+    arr = finite01(img)
+    h, w = arr.shape[:2]
+    yy, xx = np.indices((h, w), dtype=np.int32)
+    ordered = ((xx * 13 + yy * 17 + (xx ^ yy) * 3) & 255).astype(np.float32)
+    dither = (ordered / 255.0 - 0.5) / 255.0
+    out = np.clip(arr + dither[..., None], 0.0, 1.0)
+    out = (out * 255.0 + 0.5).astype(np.uint8)
     Image.fromarray(out, mode="RGB").save(path)
 
 
@@ -528,7 +534,7 @@ def chroma_delta_metrics(src_lab: np.ndarray, out_lab: np.ndarray, mask: np.ndar
     delta = out_lab - src_lab
     mean_delta = [float(delta[..., c][valid].mean()) for c in range(3)]
     max_delta = [float(np.max(np.abs(delta[..., c][valid]))) for c in range(3)]
-    src_sat = src_lab[..., 1:3]
+    src_sat = src_lab[..., 1:3] - 0.5
     neutral = valid & (np.linalg.norm(src_sat, axis=-1) < 0.055)
     if np.any(neutral):
         neutral_shift = [float(delta[..., 1][neutral].mean()), float(delta[..., 2][neutral].mean())]
@@ -576,21 +582,8 @@ def resolve_render_backend(render_backend: str, warnings: List[str]) -> Tuple[st
     return "pytorch", reason
 
 
-def sa_lut_log_encode(rgb: np.ndarray) -> np.ndarray:
-    rgb = finite01(rgb)
-    return (np.log1p(9.0 * rgb) / math.log(10.0)).astype(np.float32)
-
-
-def sa_lut_log_decode(encoded: np.ndarray) -> np.ndarray:
-    encoded = finite01(encoded)
-    return finite01((np.power(10.0, encoded) - 1.0) / 9.0)
-
-
 def identity_sa_lut(size: int, context_bins: int) -> np.ndarray:
-    axis = np.linspace(0.0, 1.0, int(size), dtype=np.float32)
-    rr, gg, bb = np.meshgrid(axis, axis, axis, indexing="ij")
-    decoded = sa_lut_log_decode(np.stack([rr, gg, bb], axis=-1))
-    return np.repeat(decoded[None, ...], int(context_bins), axis=0).astype(np.float32)
+    return np.zeros((int(context_bins), int(size), int(size), int(size), 3), dtype=np.float32)
 
 
 def make_edge_aware_base(
@@ -681,14 +674,18 @@ def fit_sa_lut(
         order = np.argsort(weights.reshape(-1)[valid])
         valid = valid[order[-int(max_samples) :]]
 
-    src_flat = sa_lut_log_encode(src_low.reshape(-1, 3)[valid])
-    ref_flat = finite01(ref_low.reshape(-1, 3)[valid])
-    base_flat = finite01(src_low.reshape(-1, 3)[valid])
+    src_flat = finite01(src_low.reshape(-1, 3)[valid])
+    src_lab_full, _ = rgb_to_lab(src_low)
+    ref_lab_full, _ = rgb_to_lab(ref_low)
+    src_lab_flat = src_lab_full.reshape(-1, 3)[valid]
+    ref_lab_flat = ref_lab_full.reshape(-1, 3)[valid]
     ctx_flat = np.clip(context_map.reshape(-1)[valid], 0.0, 1.0)
     w_flat = np.clip(weights.reshape(-1)[valid], 0.0, 1.0).astype(np.float32)
-    residual = np.clip(ref_flat - base_flat, -0.35, 0.35).astype(np.float32)
+    delta_lab = (ref_lab_flat - src_lab_flat).astype(np.float32)
+    delta_lab[..., 0] = np.clip(delta_lab[..., 0], -0.22, 0.22)
+    delta_lab[..., 1:] = np.clip(delta_lab[..., 1:], -0.22, 0.22)
 
-    res_sum = np.zeros((context_bins, size, size, size, 3), dtype=np.float32)
+    delta_sum = np.zeros((context_bins, size, size, size, 3), dtype=np.float32)
     weight_sum = np.zeros((context_bins, size, size, size), dtype=np.float32)
     color_pos = src_flat * float(size - 1)
     c0 = np.floor(color_pos).astype(np.int32)
@@ -706,31 +703,46 @@ def fit_sa_lut(
             for gi, gw in ((c0[:, 1], 1.0 - cf[:, 1]), (c1[:, 1], cf[:, 1])):
                 for bi, bw in ((c0[:, 2], 1.0 - cf[:, 2]), (c1[:, 2], cf[:, 2])):
                     ww = (w_flat * kw * rw * gw * bw).astype(np.float32)
-                    np.add.at(res_sum, (kr, ri, gi, bi, slice(None)), residual * ww[:, None])
+                    np.add.at(delta_sum, (kr, ri, gi, bi, slice(None)), delta_lab * ww[:, None])
                     np.add.at(weight_sum, (kr, ri, gi, bi), ww)
 
     denom = weight_sum[..., None] + float(max(ridge, EPS))
-    fitted_residual = res_sum / denom
+    fitted_delta_lab = delta_sum / denom
+    smooth_w = weight_sum.copy()
     if smooth > 0.0:
         if ndimage is not None:
             sigma = (0.0, float(smooth), float(smooth), float(smooth), 0.0)
             smooth_w = ndimage.gaussian_filter(weight_sum, sigma=(0.0, float(smooth), float(smooth), float(smooth)), mode="nearest")
-            smooth_r = ndimage.gaussian_filter(fitted_residual * weight_sum[..., None], sigma=sigma, mode="nearest")
-            fitted_residual = smooth_r / np.maximum(smooth_w[..., None], float(max(ridge, EPS)))
+            smooth_delta = ndimage.gaussian_filter(fitted_delta_lab * weight_sum[..., None], sigma=sigma, mode="nearest")
+            smooth_delta = smooth_delta / np.maximum(smooth_w[..., None], float(max(ridge, EPS)))
         elif cv2 is not None:
+            smooth_delta = fitted_delta_lab.copy()
+            smooth_w = weight_sum.copy()
             for k in range(context_bins):
+                smooth_w[k] = cv2.GaussianBlur(weight_sum[k].astype(np.float32), (0, 0), sigmaX=float(smooth))
                 for c in range(3):
                     for z in range(size):
-                        fitted_residual[k, z, ..., c] = cv2.GaussianBlur(fitted_residual[k, z, ..., c], (0, 0), sigmaX=float(smooth))
+                        smooth_num = cv2.GaussianBlur((fitted_delta_lab[k, z, ..., c] * weight_sum[k, z]).astype(np.float32), (0, 0), sigmaX=float(smooth))
+                        smooth_delta[k, z, ..., c] = smooth_num / np.maximum(smooth_w[k, z], float(max(ridge, EPS)))
+        else:
+            smooth_delta = fitted_delta_lab
+    else:
+        smooth_delta = fitted_delta_lab
 
+    support_ref = max(float(np.percentile(smooth_w[smooth_w > 0], 75)) if np.any(smooth_w > 0) else 1.0, EPS)
+    fill_mix = np.clip(smooth_w / support_ref, 0.0, 1.0)[..., None]
+    lut_delta_lab = fitted_delta_lab * fill_mix + smooth_delta * (1.0 - fill_mix)
+    lut_delta_lab[..., 0] = np.clip(lut_delta_lab[..., 0], -0.22, 0.22)
+    lut_delta_lab[..., 1:] = np.clip(lut_delta_lab[..., 1:], -0.22, 0.22)
     confidence = np.clip(weight_sum[..., None] / max(float(np.percentile(weight_sum[weight_sum > 0], 75)) if np.any(weight_sum > 0) else 1.0, EPS), 0.0, 1.0)
-    lut = identity + np.clip(fitted_residual, -0.30, 0.30) * confidence
-    return finite01(lut), {
+    return lut_delta_lab.astype(np.float32), {
         "fit_sample_count": int(valid.size),
         "enabled": True,
         "filled_cell_count": int(np.count_nonzero(weight_sum > 0.0)),
         "active_context_min": float(ctx_flat.min()),
         "active_context_max": float(ctx_flat.max()),
+        "lut_payload": "lab_delta",
+        "lut_encoding": "identity_rgb",
     }
 
 
@@ -738,13 +750,13 @@ def apply_sa_lut_torch(src_canvas: np.ndarray, context_map: np.ndarray, lut: np.
     if torch is None or device_name == "none":
         return src_canvas.copy()
     device = torch.device(device_name)
-    encoded = torch.from_numpy(sa_lut_log_encode(src_canvas)).to(device=device, dtype=torch.float32)
+    rgb = torch.from_numpy(finite01(src_canvas)).to(device=device, dtype=torch.float32)
     context = torch.from_numpy(np.clip(context_map, 0.0, 1.0).astype(np.float32)).to(device=device)
     mask = torch.from_numpy(np.clip(source_mask, 0.0, 1.0).astype(np.float32)).to(device=device)
-    lut_t = torch.from_numpy(finite01(lut)).to(device=device, dtype=torch.float32)
+    lut_t = torch.from_numpy(lut.astype(np.float32)).to(device=device, dtype=torch.float32)
     context_bins, size = int(lut_t.shape[0]), int(lut_t.shape[1])
 
-    flat = encoded.reshape(-1, 3)
+    flat = rgb.reshape(-1, 3)
     ctx = context.reshape(-1)
     pos = flat * float(size - 1)
     p0 = torch.floor(pos).to(torch.long)
@@ -766,9 +778,13 @@ def apply_sa_lut_torch(src_canvas: np.ndarray, context_map: np.ndarray, lut: np.
 
     out0 = interp_context(k0)
     out1 = interp_context(k1)
-    out = out0 * (1.0 - kf).unsqueeze(-1) + out1 * kf.unsqueeze(-1)
-    out = out.reshape(src_canvas.shape)
-    out = out * mask.unsqueeze(-1) + torch.from_numpy(src_canvas.astype(np.float32)).to(device=device) * (1.0 - mask.unsqueeze(-1))
+    delta_lab = (out0 * (1.0 - kf).unsqueeze(-1) + out1 * kf.unsqueeze(-1)).reshape(src_canvas.shape)
+    src_lab = torch_rgb_to_lab_norm(rgb)
+    out_lab = src_lab + delta_lab
+    out_lab[..., 0] = torch.clamp(out_lab[..., 0], 0.0, 1.0)
+    out_lab[..., 1:3] = torch.clamp(out_lab[..., 1:3], 0.0, 1.0)
+    out = torch_lab_norm_to_rgb(out_lab)
+    out = out * mask.unsqueeze(-1) + rgb * (1.0 - mask.unsqueeze(-1))
     return finite01(out.detach().cpu().numpy())
 
 
@@ -809,7 +825,7 @@ def sa_lut_global_color_transfer(
         ref_base,
         context_map,
         weights,
-        getattr(args, "sa_lut_size", 17),
+        getattr(args, "sa_lut_size", 33),
         getattr(args, "sa_lut_context_bins", 2),
         getattr(args, "sa_lut_fit_max_samples", 250000),
         getattr(args, "sa_lut_ridge", 0.035),
@@ -826,7 +842,7 @@ def sa_lut_global_color_transfer(
             "device_info": device_info,
             "render_backend": selected_backend,
             "render_backend_fallback_reason": backend_reason,
-            "lut_size": int(getattr(args, "sa_lut_size", 17)),
+            "lut_size": int(getattr(args, "sa_lut_size", 33)),
             "context_bins": int(getattr(args, "sa_lut_context_bins", 2)),
             "fit_sample_count": fit_info.get("fit_sample_count", 0),
             "context_generator": context_info,
@@ -856,6 +872,8 @@ def sa_lut_global_color_transfer(
         "active_context_min": fit_info.get("active_context_min", float(context_map.min())),
         "active_context_max": fit_info.get("active_context_max", float(context_map.max())),
         "context_generator": context_info,
+        "lut_payload": fit_info.get("lut_payload", "lab_delta"),
+        "lut_encoding": fit_info.get("lut_encoding", "identity_rgb"),
     }
     return finite01(result), params, context_map, finite01(base_result)
 
@@ -1298,8 +1316,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-luma-std-ratio", type=float, default=0.85, help="Minimum output/source luminance std ratio enforced by anti-fade guard.")
     parser.add_argument("--min-saturation-ratio", type=float, default=0.80, help="Minimum output/source saturation ratio enforced by anti-fade guard.")
     parser.add_argument("--anti-fade-strength", type=float, default=1.0, help="Strength for final contrast and saturation anti-fade guard.")
-    parser.add_argument("--pipeline-version", choices=["v0_2_5"], default="v0_2_5", help="LookAlign pipeline version.")
-    parser.add_argument("--sa-lut-size", type=int, default=17, help="SA-LUT RGB lattice resolution.")
+    parser.add_argument("--pipeline-version", choices=["v0_2_6"], default="v0_2_6", help="LookAlign pipeline version.")
+    parser.add_argument("--sa-lut-size", type=int, default=33, help="SA-LUT RGB lattice resolution.")
     parser.add_argument("--sa-lut-context-bins", type=int, default=2, help="SA-LUT context bin count.")
     parser.add_argument("--sa-lut-fit-max-samples", type=int, default=250000, help="Maximum trusted samples used for SA-LUT fitting.")
     parser.add_argument("--sa-lut-ridge", type=float, default=0.035, help="Ridge term for sparse SA-LUT cells.")
@@ -1319,7 +1337,7 @@ def lookalign_defaults() -> Dict[str, Any]:
         "align": "auto",
         "align_scale_min": 0.25,
         "align_scale_max": 8.0,
-        "pipeline_version": "v0_2_5",
+        "pipeline_version": "v0_2_6",
         "light_map_grid": 20,
         "base_radius": 24.0,
         "base_filter": "guided_auto",
@@ -1331,7 +1349,7 @@ def lookalign_defaults() -> Dict[str, Any]:
         "min_luma_std_ratio": 0.85,
         "min_saturation_ratio": 0.80,
         "anti_fade_strength": 1.0,
-        "sa_lut_size": 17,
+        "sa_lut_size": 33,
         "sa_lut_context_bins": 2,
         "sa_lut_fit_max_samples": 250000,
         "sa_lut_ridge": 0.035,
@@ -1487,7 +1505,7 @@ def run_lookalign(
 
     aligned_ref_vis = reference_canvas * reference_mask[..., None] + (1.0 - reference_mask[..., None])
     debug_data = {
-        "pipeline_version": "v0_2_5",
+        "pipeline_version": "v0_2_6",
         "source_shape": list(src.shape),
         "reference_shape": list(ref.shape),
         "estimated_transform": matrix.astype(float).tolist(),

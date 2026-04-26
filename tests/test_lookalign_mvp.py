@@ -33,6 +33,10 @@ def mean_lab_ab(img: np.ndarray) -> np.ndarray:
     return lab[..., 1:3].reshape(-1, 2).mean(axis=0)
 
 
+def centered_lab_ab(img: np.ndarray) -> np.ndarray:
+    return mean_lab_ab(img) - 0.5
+
+
 def warm_reference(size: int = 96) -> np.ndarray:
     y, x = np.mgrid[0:size, 0:size].astype(np.float32)
     base = 0.52 + 0.10 * np.sin(x / 8.5) + 0.07 * np.cos(y / 10.5)
@@ -121,9 +125,9 @@ class LookAlignAntiFadeTests(unittest.TestCase):
         source = np.full((96, 96, 3), 0.52, dtype=np.float32)
         reference = warm_reference(96)
         output = self.run_synthetic(source, reference)
-        out_ab = mean_lab_ab(output)
-        self.assertLess(abs(float(out_ab[0]) - 0.5), 0.02)
-        self.assertLess(abs(float(out_ab[1]) - 0.5), 0.025)
+        out_ab = centered_lab_ab(output)
+        self.assertLess(abs(float(out_ab[0])), 0.02)
+        self.assertLess(abs(float(out_ab[1])), 0.025)
 
     def test_white_and_gray_patches_remain_near_neutral(self) -> None:
         source = np.full((96, 96, 3), 0.50, dtype=np.float32)
@@ -134,9 +138,9 @@ class LookAlignAntiFadeTests(unittest.TestCase):
         output = self.run_synthetic(source, reference)
         out_lab, _ = la.rgb_to_lab(output)
         for sl in [slice(0, 32), slice(32, 64), slice(64, 96)]:
-            patch_ab = out_lab[:, sl, 1:3].reshape(-1, 2).mean(axis=0)
-            self.assertLess(abs(float(patch_ab[0]) - 0.5), 0.025)
-            self.assertLess(abs(float(patch_ab[1]) - 0.5), 0.03)
+            patch_ab = out_lab[:, sl, 1:3].reshape(-1, 2).mean(axis=0) - 0.5
+            self.assertLess(abs(float(patch_ab[0])), 0.025)
+            self.assertLess(abs(float(patch_ab[1])), 0.03)
 
     def test_chroma_moves_in_non_neutral_regions(self) -> None:
         size = 96
@@ -184,6 +188,8 @@ class LookAlignSALUTTests(unittest.TestCase):
         matched, params, context, base_matched = la.sa_lut_global_color_transfer(source, source, reference, weights, weights, args, warnings)
 
         self.assertEqual(params["method"], "sa_lut")
+        self.assertEqual(params["lut_payload"], "lab_delta")
+        self.assertEqual(params["lut_encoding"], "identity_rgb")
         self.assertEqual(context.shape, weights.shape)
         self.assertEqual(base_matched.shape, source.shape)
         before = float(np.mean((source - reference) ** 2))
@@ -207,6 +213,78 @@ class LookAlignSALUTTests(unittest.TestCase):
         self.assertFalse(params["enabled"])
         self.assertLess(float(np.mean(np.abs(matched - source))), 0.001)
         self.assertTrue(any("SA-LUT fitting skipped" in msg for msg in warnings))
+
+    def test_sa_lut_identity_preserves_source_without_log_bias(self) -> None:
+        source = synthetic_source(40)
+        weights = np.ones((40, 40), dtype=np.float32)
+        warnings: list[str] = []
+        args = la._config_to_namespace({"sa_lut_size": 9, "sa_lut_fit_max_samples": 0})
+
+        matched, params, _, _ = la.sa_lut_global_color_transfer(source, source, source, weights, weights, args, warnings)
+
+        self.assertTrue(params["enabled"])
+        self.assertLess(float(np.mean(np.abs(matched - source))), 0.003)
+
+    def test_sa_lut_lab_delta_moves_luminance_more_than_chroma_for_luma_reference(self) -> None:
+        source = synthetic_source(48)
+        reference = np.clip(source * 1.18, 0.0, 1.0)
+        weights = np.ones((48, 48), dtype=np.float32)
+        warnings: list[str] = []
+        args = la._config_to_namespace({"sa_lut_size": 9, "sa_lut_fit_max_samples": 0})
+
+        matched, _, _, _ = la.sa_lut_global_color_transfer(source, source, reference, weights, weights, args, warnings)
+        src_lab, _ = la.rgb_to_lab(source)
+        out_lab, _ = la.rgb_to_lab(matched)
+        delta = np.abs(out_lab - src_lab)
+
+        self.assertGreater(float(delta[..., 0].mean()), float(delta[..., 1:3].mean()) * 1.5)
+
+    def test_sa_lut_lab_delta_moves_chroma_for_chroma_reference(self) -> None:
+        source = synthetic_source(48)
+        reference = source.copy()
+        reference[..., 0] = np.clip(reference[..., 0] + 0.12, 0.0, 1.0)
+        reference[..., 2] = np.clip(reference[..., 2] - 0.08, 0.0, 1.0)
+        weights = np.ones((48, 48), dtype=np.float32)
+        warnings: list[str] = []
+        args = la._config_to_namespace({"sa_lut_size": 9, "sa_lut_fit_max_samples": 0})
+
+        matched, _, _, _ = la.sa_lut_global_color_transfer(source, source, reference, weights, weights, args, warnings)
+        src_lab, _ = la.rgb_to_lab(source)
+        out_lab, _ = la.rgb_to_lab(matched)
+        delta = np.abs(out_lab - src_lab)
+
+        self.assertGreater(float(delta[..., 1:3].mean()), 0.01)
+
+    def test_sa_lut_weak_cells_fill_from_neighbors(self) -> None:
+        size = 48
+        source = synthetic_source(size)
+        reference = np.clip(source + np.array([0.08, -0.02, 0.04], dtype=np.float32), 0.0, 1.0)
+        context = np.linspace(0.2, 0.8, size * size, dtype=np.float32).reshape(size, size)
+        weights = np.zeros((size, size), dtype=np.float32)
+        weights[::4, ::4] = 1.0
+
+        lut, info = la.fit_sa_lut(source, reference, context, weights, size=9, context_bins=2, max_samples=0, ridge=0.01, smooth=0.75)
+
+        self.assertTrue(info["enabled"])
+        self.assertGreater(float(np.mean(np.abs(lut))), 0.0035)
+
+    def test_save_rgb_dither_is_deterministic_and_not_plain_rounding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            img = np.tile(np.linspace(0.0, 1.0, 64, dtype=np.float32), (32, 1))
+            rgb = np.stack([img, img, img], axis=-1)
+            a = tmp_path / "a.png"
+            b = tmp_path / "b.png"
+            la.save_rgb(a, rgb)
+            la.save_rgb(b, rgb)
+            arr_a = np.asarray(Image.open(a), dtype=np.uint8)
+            arr_b = np.asarray(Image.open(b), dtype=np.uint8)
+            plain = (np.clip(rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+            self.assertTrue(np.array_equal(arr_a, arr_b))
+            self.assertFalse(np.array_equal(arr_a, plain))
+            self.assertGreaterEqual(int(arr_a.min()), 0)
+            self.assertLessEqual(int(arr_a.max()), 255)
 
     def test_light_map_reduces_local_luminance_error(self) -> None:
         size = 72

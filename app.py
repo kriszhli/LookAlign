@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Gradio UI for LookAlign V0.2.5."""
+"""Local Gradio UI for LookAlign V0.2.6."""
 
 from __future__ import annotations
 
@@ -111,8 +111,8 @@ def initial_paths() -> Dict[str, Optional[str]]:
 
 def build_app() -> gr.Blocks:
     defaults = initial_paths()
-    with gr.Blocks(title="LookAlign V0.2.5") as demo:
-        gr.Markdown("# LookAlign V0.2.5")
+    with gr.Blocks(title="LookAlign V0.2.6") as demo:
+        gr.Markdown("# LookAlign V0.2.6")
         state = gr.State(defaults)
 
         with gr.Row():
