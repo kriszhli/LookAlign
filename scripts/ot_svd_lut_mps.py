@@ -1,4 +1,4 @@
-"""LookAlign V0.3.1: MPS-native sliced OT distilled into an SVD-smoothed LUT."""
+"""LookAlign global matching: MPS-native sliced OT distilled into an SVD-smoothed LUT."""
 
 from __future__ import annotations
 
@@ -16,12 +16,13 @@ from PIL import Image
 
 
 Tensor = torch.Tensor
-PIPELINE_VERSION = "v0.3.1-mps-ot-svd-lut"
+GLOBAL_STAGE_VERSION = "v0.3.5-global-mps-ot-svd-lut"
+PIPELINE_VERSION = "v0.3.5-mps-global-ot-local-diffuse"
 
 
 @dataclass
 class OTSVDLUTConfig:
-    # V0.3.1 GLOBAL MATCH LOCKED PARAMETERS
+    # V0.3.5 GLOBAL MATCH LOCKED PARAMETERS
     # These are intentionally hard-coded from the validated UI settings in
     # "Screenshot 2026-04-26 at 16.05.52.png". Do not expose these as Gradio
     # sliders while the global base stage is being stabilized.
@@ -43,7 +44,7 @@ class OTSVDLUTConfig:
 def require_mps() -> torch.device:
     if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
         raise RuntimeError(
-            "LookAlign V0.3.1 requires PyTorch MPS in this interpreter. "
+            "LookAlign V0.3.5 requires PyTorch MPS in this interpreter. "
             "Run `python3 -c \"import torch; print(torch.backends.mps.is_available())\"` "
             "with the same Python used by the app."
         )
@@ -270,27 +271,31 @@ def protect_neutral_lut(identity_rgb: Tensor, delta_lab: Tensor, strength: float
     return protected
 
 
-def make_rgb_lut(delta_lab: Tensor, cfg: OTSVDLUTConfig) -> Tensor:
+def make_oklab_lut(delta_lab: Tensor, cfg: OTSVDLUTConfig) -> Tensor:
     identity_rgb = identity_lut_rgb(cfg.lut_size, delta_lab.device, delta_lab.dtype)
     identity_lab = rgb_to_oklab(identity_rgb.unsqueeze(0))[0]
     delta_lab = protect_neutral_lut(identity_rgb, delta_lab, cfg.neutral_protection)
     mapped_lab = identity_lab + delta_lab
     mapped_lab[0] = mapped_lab[0].clamp(identity_lab[0] - float(cfg.max_luma_delta), identity_lab[0] + float(cfg.max_luma_delta))
-    mapped_rgb = oklab_to_rgb(mapped_lab.unsqueeze(0))[0]
-    return soft_gamut_compress(mapped_rgb)
+    return mapped_lab
 
 
 def soft_gamut_compress(rgb: Tensor) -> Tensor:
     return rgb.clamp(0.0, 1.0)
 
 
-def apply_lut(lut: Tensor, img: Tensor, chunk_pixels: int) -> Tensor:
+def apply_lut_channels(lut: Tensor, img: Tensor, chunk_pixels: int, clamp_rgb: bool = False) -> Tensor:
     flat = flatten_rgb(img)
     chunks = []
     for start in range(0, int(flat.shape[0]), int(chunk_pixels)):
         chunks.append(sample_lut_flat(lut, flat[start : start + int(chunk_pixels)]))
     out = torch.cat(chunks, dim=0).reshape(img.shape[0], img.shape[2], img.shape[3], 3)
-    return out.permute(0, 3, 1, 2).contiguous().clamp(0.0, 1.0)
+    out = out.permute(0, 3, 1, 2).contiguous()
+    return out.clamp(0.0, 1.0) if clamp_rgb else out
+
+
+def apply_lut(lut: Tensor, img: Tensor, chunk_pixels: int) -> Tensor:
+    return apply_lut_channels(lut, img, chunk_pixels, clamp_rgb=True)
 
 
 def sample_lut_flat(lut: Tensor, rgb: Tensor) -> Tensor:
@@ -315,12 +320,14 @@ def support_visual(support: Tensor) -> np.ndarray:
 
 
 def image_stats(src: Tensor, out: Tensor) -> Dict[str, float]:
-    src_lab = rgb_to_oklab(src)
-    out_lab = rgb_to_oklab(out)
+    return image_stats_from_lab(rgb_to_oklab(src), rgb_to_oklab(out), out)
+
+
+def image_stats_from_lab(src_lab: Tensor, out_lab: Tensor, out_rgb: Tensor) -> Dict[str, float]:
     delta = out_lab - src_lab
     chroma_src = src_lab[:, 1:3].norm(dim=1)
     chroma_out = out_lab[:, 1:3].norm(dim=1)
-    compressed = ((out <= 0.001) | (out >= 0.999)).float().mean()
+    compressed = ((out_rgb <= 0.001) | (out_rgb >= 0.999)).float().mean()
     return {
         "mean_luma_delta": float(delta[:, 0].mean().detach().cpu()),
         "mean_abs_luma_delta": float(delta[:, 0].abs().mean().detach().cpu()),
@@ -332,6 +339,10 @@ def image_stats(src: Tensor, out: Tensor) -> Dict[str, float]:
 
 def prefixed_stats(prefix: str, src: Tensor, out: Tensor) -> Dict[str, float]:
     return {f"{prefix}_{key}": value for key, value in image_stats(src, out).items()}
+
+
+def prefixed_stats_from_lab(prefix: str, src_lab: Tensor, out_lab: Tensor, out_rgb: Tensor) -> Dict[str, float]:
+    return {f"{prefix}_{key}": value for key, value in image_stats_from_lab(src_lab, out_lab, out_rgb).items()}
 
 
 def run_ot_svd_lut_mps(
@@ -352,6 +363,7 @@ def run_ot_svd_lut_mps(
     source = to_nchw_mps(source_np, device)
     reference = to_nchw_mps(reference_np, device)
     reference_resized = resize_to_hw(reference, source.shape[2], source.shape[3])
+    source_lab = rgb_to_oklab(source)
     source_fit = resize_long_edge(source, cfg.fit_long_edge)
     reference_fit = resize_to_hw(reference_resized, source_fit.shape[2], source_fit.shape[3])
     timings["load_and_resize"] = time.perf_counter() - t0
@@ -368,18 +380,23 @@ def run_ot_svd_lut_mps(
 
     t2 = time.perf_counter()
     ot_splat_delta, support = splat_lut_delta(src_samples_rgb[: ot_delta.shape[0]], ot_delta, cfg)
-    ot_splat_lut = make_rgb_lut(ot_splat_delta, cfg)
+    ot_splat_lut_lab = make_oklab_lut(ot_splat_delta, cfg)
     filled_delta = smooth_lut_delta(ot_splat_delta, support, cfg.weak_cell_mix)
-    filled_lut = make_rgb_lut(filled_delta, cfg)
+    filled_lut_lab = make_oklab_lut(filled_delta, cfg)
     svd_delta = svd_style_smooth(filled_delta, cfg.svd_rank, cfg.svd_smoothing)
-    svd_lut = make_rgb_lut(svd_delta, cfg)
+    svd_lut_lab = make_oklab_lut(svd_delta, cfg)
     timings["lut_fit_and_smooth"] = time.perf_counter() - t2
 
     t3 = time.perf_counter()
-    after_ot_splat = apply_lut(ot_splat_lut, source, cfg.apply_chunk_pixels)
-    after_lut_fill = apply_lut(filled_lut, source, cfg.apply_chunk_pixels)
-    after_svd_lut = apply_lut(svd_lut, source, cfg.apply_chunk_pixels)
+    after_ot_splat_lab = apply_lut_channels(ot_splat_lut_lab, source, cfg.apply_chunk_pixels)
+    after_lut_fill_lab = apply_lut_channels(filled_lut_lab, source, cfg.apply_chunk_pixels)
+    after_svd_lut_lab = apply_lut_channels(svd_lut_lab, source, cfg.apply_chunk_pixels)
+    after_ot_splat = soft_gamut_compress(oklab_to_rgb(after_ot_splat_lab))
+    after_lut_fill = soft_gamut_compress(oklab_to_rgb(after_lut_fill_lab))
+    after_svd_lut = soft_gamut_compress(oklab_to_rgb(after_svd_lut_lab))
+    base_lab = after_svd_lut_lab
     base = after_svd_lut
+    reference_resized_lab = rgb_to_oklab(reference_resized)
     ot_preview = src_samples_rgb[: ot_preview_rgb.shape[0]].clone()
     preview_count = int(math.sqrt(float(ot_preview.shape[0]))) ** 2
     preview_side = int(math.sqrt(float(preview_count)))
@@ -406,14 +423,15 @@ def run_ot_svd_lut_mps(
     save_rgb(paths["after_svd_lut"], to_hwc_np(after_svd_lut))
     save_gray(paths["lut_support"], support_visual(support))
 
-    stats = image_stats(source, base)
+    stats = image_stats_from_lab(source_lab, base_lab, base)
     stage_stats = {
-        **prefixed_stats("after_ot_splat", source, after_ot_splat),
-        **prefixed_stats("after_lut_fill", source, after_lut_fill),
-        **prefixed_stats("after_svd_lut", source, after_svd_lut),
+        **prefixed_stats_from_lab("after_ot_splat", source_lab, after_ot_splat_lab, after_ot_splat),
+        **prefixed_stats_from_lab("after_lut_fill", source_lab, after_lut_fill_lab, after_lut_fill),
+        **prefixed_stats_from_lab("after_svd_lut", source_lab, after_svd_lut_lab, after_svd_lut),
     }
     metrics: Dict[str, Any] = {
-        "pipeline_version": PIPELINE_VERSION,
+        "pipeline_version": GLOBAL_STAGE_VERSION,
+        "global_stage_version": GLOBAL_STAGE_VERSION,
         "device": str(device),
         "mps_available": True,
         "source_shape": list(source_np.shape),
@@ -428,4 +446,12 @@ def run_ot_svd_lut_mps(
         "paths": paths,
     }
     Path(paths["metrics"]).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    metrics["tensors"] = {
+        "base_intermediate_lab": base_lab,
+        "base_intermediate_rgb": base,
+        "reference_resized_lab": reference_resized_lab,
+        "reference_resized_rgb": reference_resized,
+        "source_lab": source_lab,
+        "source_rgb": source,
+    }
     return metrics
