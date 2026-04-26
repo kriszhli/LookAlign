@@ -21,16 +21,20 @@ PIPELINE_VERSION = "v0.3.1-mps-ot-svd-lut"
 
 @dataclass
 class OTSVDLUTConfig:
+    # V0.3.1 GLOBAL MATCH LOCKED PARAMETERS
+    # These are intentionally hard-coded from the validated UI settings in
+    # "Screenshot 2026-04-26 at 16.05.52.png". Do not expose these as Gradio
+    # sliders while the global base stage is being stabilized.
     fit_long_edge: int = 768
     sample_count: int = 131072
-    ot_iterations: int = 64
+    ot_iterations: int = 128
     partial_ratio: float = 0.85
     lut_size: int = 33
     svd_rank: int = 8
-    svd_smoothing: float = 0.35
-    max_luma_delta: float = 0.18
-    max_chroma_scale: float = 1.25
-    neutral_protection: float = 0.85
+    svd_smoothing: float = 0.13
+    max_luma_delta: float = 0.35
+    max_chroma_scale: float = 2.0
+    neutral_protection: float = 0.0
     weak_cell_mix: float = 0.85
     apply_chunk_pixels: int = 262144
     seed: int = 1234
@@ -155,27 +159,29 @@ def sliced_partial_ot_delta(src_lab: Tensor, ref_lab: Tensor, cfg: OTSVDLUTConfi
     start = max(0, (count - keep) // 2)
     stop = min(count, start + keep)
     directions = build_ot_directions(cfg.ot_iterations, src_lab.device, src_lab.dtype, cfg.seed)
-    delta_sum = torch.zeros_like(src_lab)
-    count_sum = torch.zeros((count, 1), device=src_lab.device, dtype=src_lab.dtype)
+    transported = src_lab.clone()
+    update_counts = torch.zeros((count, 1), device=src_lab.device, dtype=src_lab.dtype)
 
     for direction in directions:
-        src_proj = src_lab @ direction
+        src_proj = transported @ direction
         ref_proj = ref_lab @ direction
         src_order = torch.argsort(src_proj)
         ref_order = torch.argsort(ref_proj)
         src_idx = src_order[start:stop]
         ref_idx = ref_order[start:stop]
-        delta = ref_lab[ref_idx] - src_lab[src_idx]
-        delta[:, 0] = delta[:, 0].clamp(-float(cfg.max_luma_delta), float(cfg.max_luma_delta))
-        src_chroma = src_lab[src_idx, 1:3].norm(dim=1, keepdim=True).clamp_min(1e-5)
-        new_chroma = (src_lab[src_idx, 1:3] + delta[:, 1:3]).norm(dim=1, keepdim=True)
-        max_chroma = src_chroma * float(max(1.0, cfg.max_chroma_scale))
-        scale = torch.minimum(torch.ones_like(new_chroma), max_chroma / new_chroma.clamp_min(1e-5))
-        delta[:, 1:3] = (src_lab[src_idx, 1:3] + delta[:, 1:3]) * scale - src_lab[src_idx, 1:3]
-        delta_sum.index_add_(0, src_idx, delta)
-        count_sum.index_add_(0, src_idx, torch.ones_like(delta[:, :1]))
+        projected_delta = (ref_proj[ref_idx] - src_proj[src_idx]).unsqueeze(1) * direction.unsqueeze(0)
+        transported[src_idx] = transported[src_idx] + projected_delta
+        update_counts.index_add_(0, src_idx, torch.ones((src_idx.shape[0], 1), device=src_lab.device, dtype=src_lab.dtype))
 
-    return delta_sum / count_sum.clamp_min(1.0)
+    total_delta = transported - src_lab
+    total_delta[:, 0] = total_delta[:, 0].clamp(-float(cfg.max_luma_delta), float(cfg.max_luma_delta))
+    src_chroma = src_lab[:, 1:3].norm(dim=1, keepdim=True)
+    mapped_chroma = (src_lab[:, 1:3] + total_delta[:, 1:3]).norm(dim=1, keepdim=True)
+    max_chroma = src_chroma.clamp_min(1e-5) * float(max(1.0, cfg.max_chroma_scale))
+    scale = torch.minimum(torch.ones_like(mapped_chroma), max_chroma / mapped_chroma.clamp_min(1e-5))
+    total_delta[:, 1:3] = (src_lab[:, 1:3] + total_delta[:, 1:3]) * scale - src_lab[:, 1:3]
+    total_delta = torch.where(update_counts > 0.0, total_delta, torch.zeros_like(total_delta))
+    return total_delta
 
 
 def identity_lut_rgb(size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -275,9 +281,7 @@ def make_rgb_lut(delta_lab: Tensor, cfg: OTSVDLUTConfig) -> Tensor:
 
 
 def soft_gamut_compress(rgb: Tensor) -> Tensor:
-    below = F.softplus(-rgb * 8.0) / 8.0
-    above = F.softplus((rgb - 1.0) * 8.0) / 8.0
-    return (rgb + below - above).clamp(0.0, 1.0)
+    return rgb.clamp(0.0, 1.0)
 
 
 def apply_lut(lut: Tensor, img: Tensor, chunk_pixels: int) -> Tensor:
@@ -326,6 +330,10 @@ def image_stats(src: Tensor, out: Tensor) -> Dict[str, float]:
     }
 
 
+def prefixed_stats(prefix: str, src: Tensor, out: Tensor) -> Dict[str, float]:
+    return {f"{prefix}_{key}": value for key, value in image_stats(src, out).items()}
+
+
 def run_ot_svd_lut_mps(
     source_path: str | Path,
     reference_path: str | Path,
@@ -359,14 +367,19 @@ def run_ot_svd_lut_mps(
     timings["sliced_partial_ot"] = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    dense_delta, support = splat_lut_delta(src_samples_rgb[: ot_delta.shape[0]], ot_delta, cfg)
-    dense_delta = smooth_lut_delta(dense_delta, support, cfg.weak_cell_mix)
-    dense_delta = svd_style_smooth(dense_delta, cfg.svd_rank, cfg.svd_smoothing)
-    lut_rgb = make_rgb_lut(dense_delta, cfg)
+    ot_splat_delta, support = splat_lut_delta(src_samples_rgb[: ot_delta.shape[0]], ot_delta, cfg)
+    ot_splat_lut = make_rgb_lut(ot_splat_delta, cfg)
+    filled_delta = smooth_lut_delta(ot_splat_delta, support, cfg.weak_cell_mix)
+    filled_lut = make_rgb_lut(filled_delta, cfg)
+    svd_delta = svd_style_smooth(filled_delta, cfg.svd_rank, cfg.svd_smoothing)
+    svd_lut = make_rgb_lut(svd_delta, cfg)
     timings["lut_fit_and_smooth"] = time.perf_counter() - t2
 
     t3 = time.perf_counter()
-    base = apply_lut(lut_rgb, source, cfg.apply_chunk_pixels)
+    after_ot_splat = apply_lut(ot_splat_lut, source, cfg.apply_chunk_pixels)
+    after_lut_fill = apply_lut(filled_lut, source, cfg.apply_chunk_pixels)
+    after_svd_lut = apply_lut(svd_lut, source, cfg.apply_chunk_pixels)
+    base = after_svd_lut
     ot_preview = src_samples_rgb[: ot_preview_rgb.shape[0]].clone()
     preview_count = int(math.sqrt(float(ot_preview.shape[0]))) ** 2
     preview_side = int(math.sqrt(float(preview_count)))
@@ -378,6 +391,9 @@ def run_ot_svd_lut_mps(
         "reference_resized": str(output_dir / "reference_resized.png"),
         "source_fit": str(output_dir / "source_fit.png"),
         "ot_preview": str(output_dir / "ot_preview.png"),
+        "after_ot_splat": str(output_dir / "after_ot_splat.png"),
+        "after_lut_fill": str(output_dir / "after_lut_fill.png"),
+        "after_svd_lut": str(output_dir / "after_svd_lut.png"),
         "lut_support": str(output_dir / "lut_support.png"),
         "metrics": str(output_dir / "metrics.json"),
     }
@@ -385,9 +401,17 @@ def run_ot_svd_lut_mps(
     save_rgb(paths["reference_resized"], to_hwc_np(reference_resized))
     save_rgb(paths["source_fit"], to_hwc_np(source_fit))
     save_rgb(paths["ot_preview"], to_hwc_np(ot_preview_img))
+    save_rgb(paths["after_ot_splat"], to_hwc_np(after_ot_splat))
+    save_rgb(paths["after_lut_fill"], to_hwc_np(after_lut_fill))
+    save_rgb(paths["after_svd_lut"], to_hwc_np(after_svd_lut))
     save_gray(paths["lut_support"], support_visual(support))
 
     stats = image_stats(source, base)
+    stage_stats = {
+        **prefixed_stats("after_ot_splat", source, after_ot_splat),
+        **prefixed_stats("after_lut_fill", source, after_lut_fill),
+        **prefixed_stats("after_svd_lut", source, after_svd_lut),
+    }
     metrics: Dict[str, Any] = {
         "pipeline_version": PIPELINE_VERSION,
         "device": str(device),
@@ -400,6 +424,7 @@ def run_ot_svd_lut_mps(
         "lut_support_coverage": float((support > 0).float().mean().detach().cpu()),
         "timings": timings,
         **stats,
+        "stage_stats": stage_stats,
         "paths": paths,
     }
     Path(paths["metrics"]).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
