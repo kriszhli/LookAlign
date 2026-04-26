@@ -17,7 +17,7 @@ DEFAULT_SOURCE = ROOT / "inputs" / "source.png"
 DEFAULT_REFERENCE = ROOT / "inputs" / "reference.png"
 OUTPUTS_DIR = ROOT / "outputs"
 
-IMAGE_OPTIONS = ["Source", "Aligned Reference", "SA-LUT Base", "Local Residual Result", "LookAlign Output"]
+IMAGE_OPTIONS = ["Source", "Aligned Reference", "SA-LUT Base", "Light Map Result", "LookAlign Output"]
 
 
 def existing_path(path: Path) -> Optional[str]:
@@ -45,7 +45,7 @@ def run_ui(
     local_luma_strength: float,
     detail_strength: float,
     base_radius: float,
-    residual_grid: int,
+    light_map_grid: int,
     trust_threshold: float,
     min_luma_std_ratio: float,
     min_saturation_ratio: float,
@@ -67,7 +67,7 @@ def run_ui(
         "local_luma_strength": float(local_luma_strength),
         "detail_strength": float(detail_strength),
         "base_radius": float(base_radius),
-        "residual_grid": int(residual_grid),
+        "light_map_grid": int(light_map_grid),
         "trust_threshold": float(trust_threshold),
         "min_luma_std_ratio": float(min_luma_std_ratio),
         "min_saturation_ratio": float(min_saturation_ratio),
@@ -80,7 +80,7 @@ def run_ui(
         "Source": source,
         "Aligned Reference": debug_paths.get("aligned_reference"),
         "SA-LUT Base": debug_paths.get("sa_lut_base_result"),
-        "Local Residual Result": debug_paths.get("local_residual_result"),
+        "Light Map Result": debug_paths.get("light_map_result"),
         "LookAlign Output": result["output_path"],
     }
 
@@ -90,10 +90,10 @@ def run_ui(
         debug_paths.get("source_base"),
         debug_paths.get("reference_base"),
         debug_paths.get("sa_lut_base_result"),
-        debug_paths.get("residual_luma_gain"),
-        debug_paths.get("residual_luma_offset"),
-        debug_paths.get("residual_chroma_a"),
-        debug_paths.get("residual_confidence"),
+        debug_paths.get("light_map_coarse"),
+        debug_paths.get("light_map_guided"),
+        debug_paths.get("light_map_confidence"),
+        debug_paths.get("light_map_edge_gate"),
         result["output_path"],
         paths,
     )
@@ -141,7 +141,7 @@ def build_app() -> gr.Blocks:
                 value=0.8,
                 step=0.01,
                 label="local_strength",
-                info="How strongly local color corrections are blended in.",
+                info="How strongly the source-guided light map is blended in.",
             )
             local_luma_strength = gr.Slider(
                 0.0,
@@ -149,7 +149,7 @@ def build_app() -> gr.Blocks:
                 value=0.25,
                 step=0.01,
                 label="local_luma_strength",
-                info="How strongly local corrections may change luminance.",
+                info="How strongly the light map may change luminance.",
             )
             detail_strength = gr.Slider(
                 0.0,
@@ -169,13 +169,13 @@ def build_app() -> gr.Blocks:
                 label="base_radius",
                 info="Edge-aware base smoothing radius.",
             )
-            residual_grid = gr.Slider(
+            light_map_grid = gr.Slider(
                 2,
                 64,
-                value=16,
+                value=20,
                 step=1,
-                label="residual_grid",
-                info="Number of rows used for residual luminance and color maps.",
+                label="light_map_grid",
+                info="Number of rows used for the coarse light/exposure map.",
             )
             trust_threshold = gr.Slider(
                 0.0,
@@ -220,7 +220,7 @@ def build_app() -> gr.Blocks:
                     compare_a = gr.Dropdown(IMAGE_OPTIONS, value="SA-LUT Base", label="Comparison A")
                     compare_b = gr.Dropdown(IMAGE_OPTIONS, value="LookAlign Output", label="Comparison B")
                 comparison = gr.ImageSlider(
-                    value=build_comparison_value({"Source": defaults["Source"], "Aligned Reference": defaults["Reference"], "SA-LUT Base": defaults["Reference"], "Local Residual Result": defaults["Reference"], "LookAlign Output": defaults["Reference"]}, "SA-LUT Base", "LookAlign Output"),
+                    value=build_comparison_value({"Source": defaults["Source"], "Aligned Reference": defaults["Reference"], "SA-LUT Base": defaults["Reference"], "Light Map Result": defaults["Reference"], "LookAlign Output": defaults["Reference"]}, "SA-LUT Base", "LookAlign Output"),
                     type="filepath",
                     label="Before / after comparison",
                     interactive=False,
@@ -234,10 +234,10 @@ def build_app() -> gr.Blocks:
             sa_lut_base = gr.Image(label="SA-LUT base result", type="filepath")
 
         with gr.Row():
-            residual_luma_gain = gr.Image(label="Residual luminance gain", type="filepath")
-            residual_luma_offset = gr.Image(label="Residual luminance offset", type="filepath")
-            residual_chroma = gr.Image(label="Residual chroma A", type="filepath")
-            residual_confidence = gr.Image(label="Residual confidence", type="filepath")
+            light_map_coarse = gr.Image(label="Coarse light map", type="filepath")
+            light_map_guided = gr.Image(label="Guided light map", type="filepath")
+            light_map_confidence = gr.Image(label="Light map confidence", type="filepath")
+            light_map_edge_gate = gr.Image(label="Light map edge gate", type="filepath")
 
         download = gr.File(label="Download output PNG")
 
@@ -251,7 +251,7 @@ def build_app() -> gr.Blocks:
                 local_luma_strength,
                 detail_strength,
                 base_radius,
-                residual_grid,
+                light_map_grid,
                 trust_threshold,
                 min_luma_std_ratio,
                 min_saturation_ratio,
@@ -265,10 +265,10 @@ def build_app() -> gr.Blocks:
                 source_base,
                 reference_base,
                 sa_lut_base,
-                residual_luma_gain,
-                residual_luma_offset,
-                residual_chroma,
-                residual_confidence,
+                light_map_coarse,
+                light_map_guided,
+                light_map_confidence,
+                light_map_edge_gate,
                 download,
                 state,
             ],

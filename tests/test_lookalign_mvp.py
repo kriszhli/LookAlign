@@ -51,7 +51,7 @@ class LookAlignAntiFadeTests(unittest.TestCase):
             run_config = {
                 "align": "identity",
                 "base_radius": 5.0,
-                "residual_grid": 6,
+                "light_map_grid": 6,
                 "trust_threshold": 0.0,
                 "debug_dir": None,
             }
@@ -82,7 +82,7 @@ class LookAlignAntiFadeTests(unittest.TestCase):
         out_dist = np.linalg.norm(mean_lab_ab(output) - mean_lab_ab(reference))
         self.assertLess(out_dist, src_dist * 0.85)
 
-    def test_zero_local_luma_strength_preserves_local_luminance_structure(self) -> None:
+    def test_light_map_only_changes_luminance(self) -> None:
         size = 80
         source = synthetic_source(size)
         y, x = np.mgrid[0:size, 0:size].astype(np.float32)
@@ -92,29 +92,30 @@ class LookAlignAntiFadeTests(unittest.TestCase):
         mask = np.ones((size, size), dtype=np.float32)
         weights = np.ones((size, size), dtype=np.float32)
 
-        maps, stats = la.compute_local_residual_maps(
+        maps, stats = la.compute_light_map(
             source,
             source,
             ref,
             mask,
             weights,
-            residual_grid=4,
-            residual_smooth=0.4,
-            min_luma_gain=0.65,
-            max_luma_gain=1.45,
-            max_luma_offset=0.12,
-            max_chroma_residual=0.14,
+            light_map_grid=4,
+            light_map_smooth=0.35,
+            light_map_radius=3.0,
+            max_exposure_delta=0.18,
+            max_contrast_gain=1.35,
+            guide_eps=0.01,
+            upsample_mode="source_guided",
             warnings=[],
         )
-        local_result, _ = la.apply_residual_maps_torch(source, mask, maps, local_strength=1.0, local_luma_strength=0.0, device_name="cpu")
+        local_result, _ = la.apply_light_map_torch(source, mask, maps, local_strength=1.0, local_luma_strength=1.0, device_name="cpu")
 
         source_lab, _ = la.rgb_to_lab(source)
         local_lab, _ = la.rgb_to_lab(local_result)
         l_delta = np.abs(local_lab[..., 0] - source_lab[..., 0]).mean()
         ab_delta = np.abs(local_lab[..., 1:3] - source_lab[..., 1:3]).mean()
         self.assertTrue(stats["enabled"])
-        self.assertLess(l_delta, 0.012)
-        self.assertGreater(ab_delta, 0.004)
+        self.assertGreater(l_delta, 0.004)
+        self.assertLess(ab_delta, 0.003)
 
     def test_neutral_gray_source_does_not_turn_red(self) -> None:
         source = np.full((96, 96, 3), 0.52, dtype=np.float32)
@@ -207,32 +208,91 @@ class LookAlignSALUTTests(unittest.TestCase):
         self.assertLess(float(np.mean(np.abs(matched - source))), 0.001)
         self.assertTrue(any("SA-LUT fitting skipped" in msg for msg in warnings))
 
-    def test_residual_maps_reduce_local_luminance_error(self) -> None:
+    def test_light_map_reduces_local_luminance_error(self) -> None:
         size = 72
         source = synthetic_source(size)
         y, _ = np.mgrid[0:size, 0:size].astype(np.float32)
         reference = np.clip(source * (0.80 + 0.35 * y[..., None] / max(size - 1, 1)), 0.0, 1.0)
         mask = np.ones((size, size), dtype=np.float32)
         weights = np.ones((size, size), dtype=np.float32)
-        maps, stats = la.compute_local_residual_maps(
+        maps, stats = la.compute_light_map(
             source,
             source,
             reference,
             mask,
             weights,
-            residual_grid=6,
-            residual_smooth=0.5,
-            min_luma_gain=0.65,
-            max_luma_gain=1.45,
-            max_luma_offset=0.12,
-            max_chroma_residual=0.14,
+            light_map_grid=6,
+            light_map_smooth=0.35,
+            light_map_radius=4.0,
+            max_exposure_delta=0.18,
+            max_contrast_gain=1.35,
+            guide_eps=0.01,
+            upsample_mode="source_guided",
             warnings=[],
         )
-        adjusted, _ = la.apply_residual_maps_torch(source, mask, maps, local_strength=1.0, local_luma_strength=1.0, device_name="cpu")
+        adjusted, _ = la.apply_light_map_torch(source, mask, maps, local_strength=1.0, local_luma_strength=1.0, device_name="cpu")
         before = float(np.mean((la.luminance(source) - la.luminance(reference)) ** 2))
         after = float(np.mean((la.luminance(adjusted) - la.luminance(reference)) ** 2))
         self.assertTrue(stats["enabled"])
         self.assertLess(after, before * 0.65)
+
+    def test_light_map_grid_stays_compute_bounded(self) -> None:
+        size = 84
+        source = synthetic_source(size)
+        reference = np.clip(source + 0.08, 0.0, 1.0)
+        mask = np.ones((size, size), dtype=np.float32)
+        weights = np.ones((size, size), dtype=np.float32)
+
+        maps, stats = la.compute_light_map(
+            source,
+            source,
+            reference,
+            mask,
+            weights,
+            light_map_grid=7,
+            light_map_smooth=0.0,
+            light_map_radius=3.0,
+            max_exposure_delta=0.18,
+            max_contrast_gain=1.35,
+            guide_eps=0.01,
+            upsample_mode="source_guided",
+            warnings=[],
+        )
+
+        self.assertTrue(stats["enabled"])
+        self.assertEqual(maps["coarse_light_map"].shape[0], 7)
+        self.assertLessEqual(maps["coarse_light_map"].size, 7 * 8)
+        self.assertEqual(maps["light_map"].shape, mask.shape)
+
+    def test_source_guided_light_map_respects_luminance_edge(self) -> None:
+        size = 80
+        source = np.full((size, size, 3), 0.28, dtype=np.float32)
+        source[:, size // 2 :] = 0.72
+        reference = source.copy()
+        reference[:, : size // 2] = np.clip(reference[:, : size // 2] + 0.14, 0.0, 1.0)
+        mask = np.ones((size, size), dtype=np.float32)
+        weights = np.ones((size, size), dtype=np.float32)
+
+        maps, stats = la.compute_light_map(
+            source,
+            source,
+            reference,
+            mask,
+            weights,
+            light_map_grid=5,
+            light_map_smooth=0.0,
+            light_map_radius=6.0,
+            max_exposure_delta=0.18,
+            max_contrast_gain=1.35,
+            guide_eps=0.002,
+            upsample_mode="source_guided",
+            warnings=[],
+        )
+
+        left = float(maps["light_map"][:, : size // 2 - 4].mean())
+        right = float(maps["light_map"][:, size // 2 + 4 :].mean())
+        self.assertTrue(stats["enabled"])
+        self.assertGreater(left, right + 0.04)
 
     def test_gradio_run_ui_returns_v025_debug_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,7 +320,7 @@ class LookAlignSALUTTests(unittest.TestCase):
                 )
             paths = result[-1]
             self.assertIn("SA-LUT Base", paths)
-            self.assertIn("Local Residual Result", paths)
+            self.assertIn("Light Map Result", paths)
             self.assertTrue(Path(paths["SA-LUT Base"]).exists())
 
     @unittest.skipIf(la.torch is None, "PyTorch unavailable")

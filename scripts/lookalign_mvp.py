@@ -860,7 +860,7 @@ def sa_lut_global_color_transfer(
     return finite01(result), params, context_map, finite01(base_result)
 
 
-def smooth_residual_grid(values: np.ndarray, confidence: np.ndarray, sigma: float) -> np.ndarray:
+def smooth_weighted_grid(values: np.ndarray, confidence: np.ndarray, sigma: float) -> np.ndarray:
     if sigma <= 0:
         return values.astype(np.float32, copy=True)
     if ndimage is not None:
@@ -883,56 +883,84 @@ def smooth_residual_grid(values: np.ndarray, confidence: np.ndarray, sigma: floa
     return values.astype(np.float32, copy=True)
 
 
-def resize_map(arr: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+def resize_map(arr: np.ndarray, shape: Tuple[int, int], interpolation: int = 3) -> np.ndarray:
     h, w = shape
     if cv2 is not None:
-        interp = cv2.INTER_CUBIC if arr.ndim == 2 else cv2.INTER_CUBIC
+        interp = cv2.INTER_LINEAR if interpolation == 1 else cv2.INTER_CUBIC
         return cv2.resize(arr.astype(np.float32), (w, h), interpolation=interp).astype(np.float32)
     if ndimage is None:
         raise RuntimeError("Map resizing requires OpenCV or SciPy.")
     zoom_y = h / arr.shape[0]
     zoom_x = w / arr.shape[1]
     if arr.ndim == 2:
-        return ndimage.zoom(arr.astype(np.float32), (zoom_y, zoom_x), order=3)[:h, :w].astype(np.float32)
-    return ndimage.zoom(arr.astype(np.float32), (zoom_y, zoom_x, 1), order=3)[:h, :w].astype(np.float32)
+        return ndimage.zoom(arr.astype(np.float32), (zoom_y, zoom_x), order=interpolation)[:h, :w].astype(np.float32)
+    return ndimage.zoom(arr.astype(np.float32), (zoom_y, zoom_x, 1), order=interpolation)[:h, :w].astype(np.float32)
 
 
-def residual_map_visual(value: np.ndarray, center: float, span: float) -> np.ndarray:
+def scalar_map_visual(value: np.ndarray, center: float, span: float) -> np.ndarray:
     return np.clip(0.5 + (value.astype(np.float32) - center) / max(span, EPS), 0.0, 1.0).astype(np.float32)
 
 
-def compute_local_residual_maps(
+def guided_filter_gray(guide: np.ndarray, src: np.ndarray, radius: float, eps: float, mask: np.ndarray) -> np.ndarray:
+    if cv2 is None or radius <= 0:
+        return src.astype(np.float32, copy=True)
+    r = max(1, int(round(radius)))
+    ksize = (2 * r + 1, 2 * r + 1)
+    guide = np.clip(guide.astype(np.float32), 0.0, 1.0)
+    src = src.astype(np.float32)
+    mask = np.clip(mask.astype(np.float32), 0.0, 1.0)
+
+    def box(x: np.ndarray) -> np.ndarray:
+        return cv2.boxFilter(x.astype(np.float32), -1, ksize, normalize=False, borderType=cv2.BORDER_REFLECT101)
+
+    den = np.maximum(box(mask), EPS)
+    mean_i = box(guide * mask) / den
+    mean_p = box(src * mask) / den
+    corr_i = box(guide * guide * mask) / den
+    corr_ip = box(guide * src * mask) / den
+    var_i = corr_i - mean_i * mean_i
+    cov_ip = corr_ip - mean_i * mean_p
+    a = cov_ip / (var_i + float(max(eps, EPS)))
+    b = mean_p - a * mean_i
+    mean_a = box(a * mask) / den
+    mean_b = box(b * mask) / den
+    return (mean_a * guide + mean_b).astype(np.float32)
+
+
+def compute_light_map(
     sa_lut_base_result: np.ndarray,
     sa_lut_result: np.ndarray,
     reference_base: np.ndarray,
     source_mask: np.ndarray,
     trusted_weights: np.ndarray,
-    residual_grid: int,
-    residual_smooth: float,
-    min_luma_gain: float,
-    max_luma_gain: float,
-    max_luma_offset: float,
-    max_chroma_residual: float,
+    light_map_grid: int,
+    light_map_smooth: float,
+    light_map_radius: float,
+    max_exposure_delta: float,
+    max_contrast_gain: float,
+    guide_eps: float,
+    upsample_mode: str,
     warnings: List[str],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     h, w = source_mask.shape
     if trusted_weights.sum() < 100.0:
-        warnings.append("Residual local matching skipped: insufficient trusted support.")
+        warnings.append("Light map skipped: insufficient trusted support.")
         maps = {
-            "luma_gain": np.ones((h, w), dtype=np.float32),
-            "luma_offset": np.zeros((h, w), dtype=np.float32),
-            "chroma_delta": np.zeros((h, w, 2), dtype=np.float32),
+            "light_map": np.zeros((h, w), dtype=np.float32),
+            "coarse_light_map": np.zeros((1, 1), dtype=np.float32),
+            "contrast_gain": np.ones((h, w), dtype=np.float32),
             "confidence": np.zeros((h, w), dtype=np.float32),
+            "coarse_confidence": np.zeros((1, 1), dtype=np.float32),
+            "edge_gate": np.ones((h, w), dtype=np.float32),
         }
         return maps, {"enabled": False, "reason": "insufficient trusted support"}
 
     base_lab, space = rgb_to_lab(sa_lut_base_result)
     ref_lab, _ = rgb_to_lab(reference_base)
-    gy = max(2, int(residual_grid))
-    gx = max(2, int(round(residual_grid * w / max(h, 1))))
-    gain_grid = np.ones((gy, gx), dtype=np.float32)
-    offset_grid = np.zeros((gy, gx), dtype=np.float32)
-    chroma_grid = np.zeros((gy, gx, 2), dtype=np.float32)
+    gy = max(2, int(light_map_grid))
+    gx = max(2, int(round(light_map_grid * w / max(h, 1))))
+    light_grid = np.zeros((gy, gx), dtype=np.float32)
+    contrast_grid = np.ones((gy, gx), dtype=np.float32)
     conf_grid = np.zeros((gy, gx), dtype=np.float32)
 
     for iy in range(gy):
@@ -954,63 +982,72 @@ def compute_local_residual_maps(
             cov = float(((src_l - mean_src) * (ref_l - mean_ref) * w64).sum() / max(total, EPS))
             regression_gain = cov / max(var_src, 2e-4)
             mean_gain = mean_ref / max(mean_src, 0.03)
-            gain = 0.35 * regression_gain + 0.65 * mean_gain
-            gain = float(np.clip(gain, min_luma_gain, max_luma_gain))
-            offset = float(np.clip(mean_ref - gain * mean_src, -max_luma_offset, max_luma_offset))
-            gain_grid[iy, ix] = gain
-            offset_grid[iy, ix] = offset
-            delta_ab = ref_lab[y0:y1, x0:x1, 1:3] - base_lab[y0:y1, x0:x1, 1:3]
-            chroma_grid[iy, ix] = np.clip((delta_ab * ww[..., None]).sum(axis=(0, 1)) / max(total, EPS), -max_chroma_residual, max_chroma_residual)
+            gain = float(np.clip(0.35 * regression_gain + 0.65 * mean_gain, 1.0 / max_contrast_gain, max_contrast_gain))
+            target_mean = 0.5 + (mean_src - 0.5) * gain
+            exposure_delta = float(np.clip(mean_ref - target_mean, -max_exposure_delta, max_exposure_delta))
+            light_grid[iy, ix] = exposure_delta
+            contrast_grid[iy, ix] = gain
             conf_grid[iy, ix] = min(1.0, total / max(50.0, float((y1 - y0) * (x1 - x0)) * 0.08))
 
     if float(conf_grid.sum()) < 1.0:
-        warnings.append("Residual local matching skipped: no reliable grid cells.")
+        warnings.append("Light map skipped: no reliable grid cells.")
         maps = {
-            "luma_gain": np.ones((h, w), dtype=np.float32),
-            "luma_offset": np.zeros((h, w), dtype=np.float32),
-            "chroma_delta": np.zeros((h, w, 2), dtype=np.float32),
+            "light_map": np.zeros((h, w), dtype=np.float32),
+            "coarse_light_map": light_grid,
+            "contrast_gain": np.ones((h, w), dtype=np.float32),
             "confidence": np.zeros((h, w), dtype=np.float32),
+            "coarse_confidence": conf_grid,
+            "edge_gate": np.ones((h, w), dtype=np.float32),
         }
         return maps, {"enabled": False, "reason": "no reliable grid cells"}
 
-    smooth_sigma = max(0.0, float(residual_smooth))
-    gain_grid = smooth_residual_grid(gain_grid, conf_grid, smooth_sigma)
-    offset_grid = smooth_residual_grid(offset_grid, conf_grid, smooth_sigma)
-    chroma_grid = smooth_residual_grid(chroma_grid, conf_grid, smooth_sigma)
-    conf_grid = np.clip(smooth_residual_grid(conf_grid, conf_grid, smooth_sigma), 0.0, 1.0)
+    smooth_sigma = max(0.0, float(light_map_smooth))
+    light_grid = np.clip(smooth_weighted_grid(light_grid, conf_grid, smooth_sigma), -max_exposure_delta, max_exposure_delta)
+    contrast_grid = np.clip(smooth_weighted_grid(contrast_grid, conf_grid, smooth_sigma), 1.0 / max_contrast_gain, max_contrast_gain)
+    conf_grid = np.clip(smooth_weighted_grid(conf_grid, conf_grid, smooth_sigma), 0.0, 1.0)
 
-    gain = np.clip(resize_map(gain_grid, (h, w)), min_luma_gain, max_luma_gain)
-    offset = np.clip(resize_map(offset_grid, (h, w)), -max_luma_offset, max_luma_offset)
-    chroma = np.clip(resize_map(chroma_grid, (h, w)), -max_chroma_residual, max_chroma_residual)
-    confidence = np.clip(resize_map(conf_grid, (h, w)), 0.0, 1.0)
+    light_linear = np.clip(resize_map(light_grid, (h, w), interpolation=1), -max_exposure_delta, max_exposure_delta)
+    contrast_linear = np.clip(resize_map(contrast_grid, (h, w), interpolation=1), 1.0 / max_contrast_gain, max_contrast_gain)
+    confidence = np.clip(resize_map(conf_grid, (h, w), interpolation=1), 0.0, 1.0)
+    if str(upsample_mode or "source_guided") == "source_guided":
+        guide = luminance(sa_lut_base_result)
+        guided_mask = np.clip(source_mask * np.maximum(confidence, 0.15), 0.0, 1.0)
+        light_map = guided_filter_gray(guide, light_linear, light_map_radius, guide_eps, guided_mask)
+        contrast_gain = guided_filter_gray(guide, contrast_linear, light_map_radius, guide_eps, guided_mask)
+    else:
+        light_map = light_linear
+        contrast_gain = contrast_linear
+    light_map = np.clip(light_map, -max_exposure_delta, max_exposure_delta).astype(np.float32)
+    contrast_gain = np.clip(contrast_gain, 1.0 / max_contrast_gain, max_contrast_gain).astype(np.float32)
 
-    lum = luminance(sa_lut_result)
+    lum = luminance(sa_lut_base_result)
     sx, sy = sobel_xy(mask_aware_blur(lum, source_mask, 1.0))
     edge = np.sqrt(sx * sx + sy * sy)
     edge_ref = float(np.percentile(edge[source_mask > 0.5], 95)) if np.any(source_mask > 0.5) else 0.0
-    edge_gate = 1.0 - 0.55 * np.clip(edge / max(edge_ref, 0.03), 0.0, 1.0)
-    src_sat = sa_lut_result.max(axis=-1) - sa_lut_result.min(axis=-1)
-    neutral_gate = 1.0 - 0.85 * np.clip((0.13 - src_sat) / 0.13, 0.0, 1.0)
+    edge_gate = 1.0 - 0.25 * np.clip(edge / max(edge_ref, 0.03), 0.0, 1.0)
     confidence = confidence * edge_gate * source_mask
-    chroma = chroma * neutral_gate[..., None]
 
     maps = {
-        "luma_gain": gain.astype(np.float32),
-        "luma_offset": offset.astype(np.float32),
-        "chroma_delta": chroma.astype(np.float32),
+        "light_map": light_map.astype(np.float32),
+        "light_map_linear": light_linear.astype(np.float32),
+        "coarse_light_map": light_grid.astype(np.float32),
+        "contrast_gain": contrast_gain.astype(np.float32),
         "confidence": confidence.astype(np.float32),
+        "coarse_confidence": conf_grid.astype(np.float32),
+        "edge_gate": edge_gate.astype(np.float32),
     }
     stats = {
         "enabled": True,
         "space": space,
         "grid": [gy, gx],
+        "upsample": str(upsample_mode or "source_guided"),
+        "light_map_radius": float(light_map_radius),
         "confidence_mean": float(confidence[source_mask > 0.5].mean()) if np.any(source_mask > 0.5) else 0.0,
         "confidence_max": float(confidence.max()),
-        "luma_gain_min": float(gain.min()),
-        "luma_gain_max": float(gain.max()),
-        "luma_offset_min": float(offset.min()),
-        "luma_offset_max": float(offset.max()),
-        "max_abs_chroma_residual": float(np.max(np.abs(chroma))),
+        "light_map_min": float(light_map.min()),
+        "light_map_max": float(light_map.max()),
+        "contrast_gain_min": float(contrast_gain.min()),
+        "contrast_gain_max": float(contrast_gain.max()),
     }
     return maps, stats
 
@@ -1053,7 +1090,7 @@ def torch_lab_norm_to_rgb(lab_norm: Any) -> Any:
     return torch.clamp(srgb, 0.0, 1.0)
 
 
-def apply_residual_maps_torch(
+def apply_light_map_torch(
     sa_lut_result: np.ndarray,
     source_mask: np.ndarray,
     maps: Dict[str, np.ndarray],
@@ -1068,17 +1105,16 @@ def apply_residual_maps_torch(
     device = torch.device(device_name)
     rgb = torch.from_numpy(finite01(sa_lut_result)).to(device=device, dtype=torch.float32)
     mask = torch.from_numpy(np.clip(source_mask, 0.0, 1.0).astype(np.float32)).to(device=device)
-    gain = torch.from_numpy(maps["luma_gain"].astype(np.float32)).to(device=device)
-    offset = torch.from_numpy(maps["luma_offset"].astype(np.float32)).to(device=device)
-    chroma = torch.from_numpy(maps["chroma_delta"].astype(np.float32)).to(device=device)
+    light_map = torch.from_numpy(maps["light_map"].astype(np.float32)).to(device=device)
+    contrast_gain = torch.from_numpy(maps["contrast_gain"].astype(np.float32)).to(device=device)
     conf = torch.from_numpy(np.clip(maps["confidence"], 0.0, 1.0).astype(np.float32)).to(device=device)
     blend = torch.clamp(conf * float(np.clip(local_strength, 0.0, 1.0)) * mask, 0.0, 1.0)
     luma_strength = float(np.clip(local_luma_strength, 0.0, 1.0))
 
     lab = torch_rgb_to_lab_norm(rgb)
     adjusted = lab.clone()
-    adjusted[..., 0] = torch.clamp(lab[..., 0] * (1.0 + (gain - 1.0) * luma_strength) + offset * luma_strength, 0.0, 1.0)
-    adjusted[..., 1:3] = torch.clamp(lab[..., 1:3] + chroma, 0.0, 1.0)
+    centered_l = lab[..., 0] - 0.5
+    adjusted[..., 0] = torch.clamp(0.5 + centered_l * (1.0 + (contrast_gain - 1.0) * luma_strength) + light_map * luma_strength, 0.0, 1.0)
     out_lab = lab * (1.0 - blend.unsqueeze(-1)) + adjusted * blend.unsqueeze(-1)
     out = torch_lab_norm_to_rgb(out_lab)
     out = out * mask.unsqueeze(-1) + rgb * (1.0 - mask.unsqueeze(-1))
@@ -1251,7 +1287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--align", choices=["auto", "identity", "center"], default="auto", help="Alignment mode.")
     parser.add_argument("--align-scale-min", type=float, default=0.25, help="Minimum accepted similarity scale.")
     parser.add_argument("--align-scale-max", type=float, default=8.0, help="Maximum accepted similarity scale.")
-    parser.add_argument("--residual-grid", type=int, default=16, help="Approximate residual map grid rows.")
+    parser.add_argument("--light-map-grid", type=int, default=20, help="Approximate light map grid rows.")
     parser.add_argument("--base-radius", type=float, default=24.0, help="Edge-aware base smoothing radius.")
     parser.add_argument("--base-filter", choices=["guided_auto", "bilateral", "gaussian"], default="guided_auto", help="Low-frequency base filter.")
     parser.add_argument("--base-filter-eps", type=float, default=0.01, help="Edge-aware base filter range parameter.")
@@ -1268,11 +1304,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sa-lut-fit-max-samples", type=int, default=250000, help="Maximum trusted samples used for SA-LUT fitting.")
     parser.add_argument("--sa-lut-ridge", type=float, default=0.035, help="Ridge term for sparse SA-LUT cells.")
     parser.add_argument("--sa-lut-smooth", type=float, default=0.75, help="Gaussian smoothing sigma for fitted SA-LUT residuals.")
-    parser.add_argument("--residual-smooth", type=float, default=0.75, help="Gaussian smoothing sigma for residual maps.")
-    parser.add_argument("--min-luma-gain", type=float, default=0.65, help="Minimum residual luminance gain.")
-    parser.add_argument("--max-luma-gain", type=float, default=1.45, help="Maximum residual luminance gain.")
-    parser.add_argument("--max-luma-offset", type=float, default=0.12, help="Maximum residual luminance offset.")
-    parser.add_argument("--max-chroma-residual", type=float, default=0.14, help="Maximum residual Lab chroma delta.")
+    parser.add_argument("--light-map-smooth", type=float, default=0.35, help="Gaussian smoothing sigma for coarse light map fitting.")
+    parser.add_argument("--light-map-upsample", choices=["source_guided", "linear"], default="source_guided", help="Light map upsampling mode.")
+    parser.add_argument("--light-map-radius", type=float, default=8.0, help="Source-guided light map filter radius.")
+    parser.add_argument("--max-exposure-delta", type=float, default=0.18, help="Maximum local exposure delta in normalized Lab luminance.")
+    parser.add_argument("--max-contrast-gain", type=float, default=1.35, help="Maximum local luminance contrast gain.")
     parser.add_argument("--render-backend", choices=["auto", "pytorch", "numpy", "opencv", "coreimage", "accelerate"], default="auto", help="Rendering backend preference.")
     return parser.parse_args()
 
@@ -1284,7 +1320,7 @@ def lookalign_defaults() -> Dict[str, Any]:
         "align_scale_min": 0.25,
         "align_scale_max": 8.0,
         "pipeline_version": "v0_2_5",
-        "residual_grid": 16,
+        "light_map_grid": 20,
         "base_radius": 24.0,
         "base_filter": "guided_auto",
         "base_filter_eps": 0.01,
@@ -1300,11 +1336,11 @@ def lookalign_defaults() -> Dict[str, Any]:
         "sa_lut_fit_max_samples": 250000,
         "sa_lut_ridge": 0.035,
         "sa_lut_smooth": 0.75,
-        "residual_smooth": 0.75,
-        "min_luma_gain": 0.65,
-        "max_luma_gain": 1.45,
-        "max_luma_offset": 0.12,
-        "max_chroma_residual": 0.14,
+        "light_map_smooth": 0.35,
+        "light_map_upsample": "source_guided",
+        "light_map_radius": 8.0,
+        "max_exposure_delta": 0.18,
+        "max_contrast_gain": 1.35,
         "render_backend": "auto",
     }
 
@@ -1323,10 +1359,13 @@ def normalize_cli_paths(output: str, debug_dir: Optional[str]) -> Tuple[str, Opt
 def _config_to_namespace(config: Optional[Dict[str, Any] | argparse.Namespace]) -> argparse.Namespace:
     values = lookalign_defaults()
     if config is not None:
+        raw_config = vars(config) if isinstance(config, argparse.Namespace) else dict(config)
+        if "light_map_grid" not in raw_config and "residual_grid" in raw_config:
+            raw_config["light_map_grid"] = raw_config["residual_grid"]
         if isinstance(config, argparse.Namespace):
-            values.update(vars(config))
+            values.update(raw_config)
         else:
-            values.update(config)
+            values.update(raw_config)
     return argparse.Namespace(**values)
 
 
@@ -1391,39 +1430,40 @@ def run_lookalign(
         warnings,
     )
 
-    residual_maps, residual_stats = compute_local_residual_maps(
+    light_maps, light_stats = compute_light_map(
         sa_lut_base_low,
         sa_lut_base_result,
         reference_base,
         source_mask,
         fit_weights,
-        args.residual_grid,
-        args.residual_smooth,
-        args.min_luma_gain,
-        args.max_luma_gain,
-        args.max_luma_offset,
-        args.max_chroma_residual,
+        args.light_map_grid,
+        args.light_map_smooth,
+        args.light_map_radius,
+        args.max_exposure_delta,
+        args.max_contrast_gain,
+        args.base_filter_eps,
+        args.light_map_upsample,
         warnings,
     )
-    residual_device = str(global_params.get("selected_device", "cpu"))
+    light_map_device = str(global_params.get("selected_device", "cpu"))
     try:
-        local_result, residual_device = apply_residual_maps_torch(
+        local_result, light_map_device = apply_light_map_torch(
             sa_lut_base_result,
             source_mask,
-            residual_maps,
-            local_strength if residual_stats.get("enabled", False) else 0.0,
+            light_maps,
+            local_strength if light_stats.get("enabled", False) else 0.0,
             args.local_luma_strength,
-            residual_device,
+            light_map_device,
         )
     except Exception as exc:
-        if residual_device != "mps":
+        if light_map_device != "mps":
             raise
-        warnings.append(f"Residual map MPS application failed ({exc}); retrying on CPU.")
-        local_result, residual_device = apply_residual_maps_torch(
+        warnings.append(f"Light map MPS application failed ({exc}); retrying on CPU.")
+        local_result, light_map_device = apply_light_map_torch(
             sa_lut_base_result,
             source_mask,
-            residual_maps,
-            local_strength if residual_stats.get("enabled", False) else 0.0,
+            light_maps,
+            local_strength if light_stats.get("enabled", False) else 0.0,
             args.local_luma_strength,
             "cpu",
         )
@@ -1460,10 +1500,10 @@ def run_lookalign(
         "trusted_pixel_count": trusted_count,
         "global_fit_parameters": global_params,
         "base_filter": {"source": source_base_info, "reference": reference_base_info},
-        "residual_fit_parameters": residual_stats,
-        "residual_device": residual_device,
+        "light_map_parameters": light_stats,
+        "light_map_device": light_map_device,
         "chroma_transfer_metrics": chroma_metrics,
-        "local_strength_used": float(local_strength if residual_stats.get("enabled", False) else 0.0),
+        "local_strength_used": float(local_strength if light_stats.get("enabled", False) else 0.0),
         "local_luma_strength": float(args.local_luma_strength),
         "anti_fade_guard": guard_metrics,
         "warnings": warnings,
@@ -1473,8 +1513,7 @@ def run_lookalign(
         "source_base": finite01(source_base),
         "reference_base": finite01(reference_base),
         "sa_lut_base_result": finite01(sa_lut_base_result),
-        "local_result": finite01(local_result),
-        "local_residual_result": finite01(local_result),
+        "light_map_result": finite01(local_result),
         "final_output": output,
     }
     debug_masks = {
@@ -1482,11 +1521,10 @@ def run_lookalign(
         "overlap_mask": overlap,
         "trust_map": trust,
         "sa_lut_context_map": np.clip(sa_lut_context_map, 0.0, 1.0).astype(np.float32),
-        "residual_luma_gain": residual_map_visual(residual_maps["luma_gain"], 1.0, max(args.max_luma_gain - 1.0, 1.0 - args.min_luma_gain)),
-        "residual_luma_offset": residual_map_visual(residual_maps["luma_offset"], 0.0, args.max_luma_offset * 2.0),
-        "residual_chroma_a": residual_map_visual(residual_maps["chroma_delta"][..., 0], 0.0, args.max_chroma_residual * 2.0),
-        "residual_chroma_b": residual_map_visual(residual_maps["chroma_delta"][..., 1], 0.0, args.max_chroma_residual * 2.0),
-        "residual_confidence": np.clip(residual_maps["confidence"], 0.0, 1.0).astype(np.float32),
+        "light_map_coarse": scalar_map_visual(resize_map(light_maps["coarse_light_map"], source_mask.shape, interpolation=1), 0.0, args.max_exposure_delta * 2.0),
+        "light_map_guided": scalar_map_visual(light_maps["light_map"], 0.0, args.max_exposure_delta * 2.0),
+        "light_map_confidence": np.clip(light_maps["confidence"], 0.0, 1.0).astype(np.float32),
+        "light_map_edge_gate": np.clip(light_maps["edge_gate"], 0.0, 1.0).astype(np.float32),
     }
 
     write_debug(
@@ -1504,18 +1542,16 @@ def run_lookalign(
             "source_base",
             "reference_base",
             "sa_lut_base_result",
-            "local_result",
-            "local_residual_result",
+            "light_map_result",
             "final_output",
             "reference_valid_mask",
             "overlap_mask",
             "trust_map",
             "sa_lut_context_map",
-            "residual_luma_gain",
-            "residual_luma_offset",
-            "residual_chroma_a",
-            "residual_chroma_b",
-            "residual_confidence",
+            "light_map_coarse",
+            "light_map_guided",
+            "light_map_confidence",
+            "light_map_edge_gate",
         ]
         for name in debug_names:
             debug_paths[name] = str(debug_dir / f"{name}.png")
