@@ -517,81 +517,6 @@ def lab_to_rgb(lab_norm: np.ndarray, space: str) -> np.ndarray:
     return finite01(rgb)
 
 
-def weighted_mean_std(values: np.ndarray, weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    v = values.reshape(-1, values.shape[-1]).astype(np.float64)
-    w = weights.reshape(-1).astype(np.float64)
-    total = max(float(w.sum()), EPS)
-    mean = (v * w[:, None]).sum(axis=0) / total
-    var = ((v - mean) ** 2 * w[:, None]).sum(axis=0) / total
-    return mean.astype(np.float32), np.sqrt(np.maximum(var, EPS)).astype(np.float32)
-
-
-def weighted_quantiles(values: np.ndarray, weights: np.ndarray, quantiles: np.ndarray) -> np.ndarray:
-    v = values.reshape(-1).astype(np.float64)
-    w = weights.reshape(-1).astype(np.float64)
-    valid = np.isfinite(v) & np.isfinite(w) & (w > 0.0)
-    if int(valid.sum()) < 8:
-        finite = v[np.isfinite(v)]
-        if finite.size == 0:
-            return np.zeros_like(quantiles, dtype=np.float32)
-        return np.quantile(finite, quantiles).astype(np.float32)
-    v = v[valid]
-    w = w[valid]
-    order = np.argsort(v)
-    v = v[order]
-    w = w[order]
-    cdf = np.cumsum(w)
-    cdf /= max(float(cdf[-1]), EPS)
-    return np.interp(quantiles, cdf, v).astype(np.float32)
-
-
-def monotonic_targets(targets: np.ndarray) -> np.ndarray:
-    out = np.maximum.accumulate(targets.astype(np.float32))
-    if out.size > 1:
-        out = out + np.arange(out.size, dtype=np.float32) * 1e-5
-    return np.clip(out, 0.0, 1.0)
-
-
-def fit_luminance_tone_curve(src_l: np.ndarray, ref_l: np.ndarray, weights: np.ndarray, min_std_ratio: float) -> Dict[str, Any]:
-    qs = np.array([0.02, 0.08, 0.16, 0.30, 0.50, 0.70, 0.84, 0.92, 0.98], dtype=np.float32)
-    src_q = weighted_quantiles(src_l, weights, qs)
-    ref_q = weighted_quantiles(ref_l, weights, qs)
-    src_std = float(weighted_mean_std(src_l[..., None], weights)[1][0])
-    ref_std = float(weighted_mean_std(ref_l[..., None], weights)[1][0])
-    min_ratio = float(np.clip(min_std_ratio, 0.0, 1.0))
-    ref_q = monotonic_targets(ref_q)
-
-    if src_std > EPS and ref_std < src_std * min_ratio:
-        target_std = src_std * min_ratio
-        gain = np.clip(target_std / max(ref_std, 0.015), 1.0, 2.2)
-        median = float(ref_q[4])
-        ref_q = median + (ref_q - median) * gain
-        ref_q = ref_q * 0.82 + (median + (src_q - float(src_q[4])) * min_ratio) * 0.18
-        ref_q = monotonic_targets(ref_q)
-
-    if src_q[-1] - src_q[0] < 0.02:
-        src_q = np.linspace(0.0, 1.0, len(qs), dtype=np.float32)
-        ref_q = src_q.copy()
-
-    return {
-        "src_quantiles": src_q.astype(np.float32),
-        "ref_quantiles": ref_q.astype(np.float32),
-        "quantiles": qs,
-        "src_std": src_std,
-        "ref_std": ref_std,
-    }
-
-
-def apply_luminance_curve(luma: np.ndarray, curve: Dict[str, Any]) -> np.ndarray:
-    src_q = curve["src_quantiles"]
-    ref_q = curve["ref_quantiles"]
-    x = np.concatenate([[0.0], src_q, [1.0]]).astype(np.float32)
-    y = np.concatenate([[max(0.0, float(ref_q[0]) - float(src_q[0]))], ref_q, [min(1.0, float(ref_q[-1]) + 1.0 - float(src_q[-1]))]]).astype(np.float32)
-    x, keep = np.unique(x, return_index=True)
-    y = y[keep]
-    return np.interp(luma.reshape(-1), x, y).reshape(luma.shape).astype(np.float32)
-
-
 def chroma_delta_metrics(src_lab: np.ndarray, out_lab: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
     valid = mask > 0.5
     if not np.any(valid):
@@ -666,6 +591,37 @@ def identity_sa_lut(size: int, context_bins: int) -> np.ndarray:
     rr, gg, bb = np.meshgrid(axis, axis, axis, indexing="ij")
     decoded = sa_lut_log_decode(np.stack([rr, gg, bb], axis=-1))
     return np.repeat(decoded[None, ...], int(context_bins), axis=0).astype(np.float32)
+
+
+def make_edge_aware_base(
+    img: np.ndarray,
+    mask: np.ndarray,
+    radius: float,
+    eps: float,
+    base_filter: str,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    mode = str(base_filter or "guided_auto").lower()
+    radius = float(max(radius, 0.0))
+    if radius <= 0:
+        return finite01(img * mask[..., None]), {"backend": "identity", "radius": radius}
+
+    if cv2 is not None and mode in ("guided_auto", "bilateral", "edge_aware"):
+        sigma_space = max(1.0, radius)
+        sigma_color = float(np.clip(math.sqrt(max(eps, EPS)) * 4.0, 0.04, 0.35))
+        masked = finite01(img) * mask[..., None]
+        den = cv2.bilateralFilter(mask.astype(np.float32), 0, sigmaColor=1.0, sigmaSpace=sigma_space)
+        channels = []
+        for c in range(3):
+            num = cv2.bilateralFilter(masked[..., c].astype(np.float32), 0, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+            channels.append(num / np.maximum(den, EPS))
+        return finite01(np.stack(channels, axis=-1)), {
+            "backend": "opencv_bilateral",
+            "radius": radius,
+            "eps": float(eps),
+            "sigma_color": sigma_color,
+        }
+
+    return mask_aware_blur(img, mask, radius), {"backend": "mask_aware_gaussian", "radius": radius, "eps": float(eps)}
 
 
 def generate_sa_lut_context_map(
@@ -818,48 +774,39 @@ def apply_sa_lut_torch(src_canvas: np.ndarray, context_map: np.ndarray, lut: np.
 
 def sa_lut_global_color_transfer(
     src_canvas: np.ndarray,
-    ref_canvas: np.ndarray,
+    src_base: np.ndarray,
+    ref_base: np.ndarray,
     source_mask: np.ndarray,
     weights: np.ndarray,
-    blur_sigma: float,
     args: argparse.Namespace,
     warnings: List[str],
-) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray]:
+) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray, np.ndarray]:
     device_name, device_info = choose_sa_lut_device(prefer_mps=True)
     selected_backend, backend_reason = resolve_render_backend(getattr(args, "render_backend", "auto"), warnings)
     if torch is None:
-        warnings.append("PyTorch unavailable; falling back to legacy global color transfer.")
-        legacy, params = global_color_transfer(
-            src_canvas,
-            ref_canvas,
-            source_mask,
-            weights,
-            blur_sigma,
-            0.0,
-            args.min_luma_std_ratio,
-            args.global_chroma_mean_strength,
-            args.global_chroma_std_strength,
-            args.max_global_a_shift,
-            args.max_global_b_shift,
-            args.use_rgb_affine,
-            warnings,
-        )
-        params.update({"method": "legacy_lab", "fallback_reason": "torch unavailable"})
-        return legacy, params, np.zeros(source_mask.shape, dtype=np.float32)
+        warnings.append("PyTorch unavailable; SA-LUT global base uses source-preserving identity.")
+        params = {
+            "method": "sa_lut",
+            "enabled": False,
+            "fallback_reason": "torch unavailable",
+            "selected_device": "none",
+            "device_info": device_info,
+            "render_backend": selected_backend,
+            "render_backend_fallback_reason": backend_reason,
+        }
+        return src_canvas.copy(), params, np.zeros(source_mask.shape, dtype=np.float32), src_base.copy()
 
-    src_low = mask_aware_blur(src_canvas, source_mask, blur_sigma)
-    ref_low = mask_aware_blur(ref_canvas, (weights > 0).astype(np.float32), blur_sigma)
     try:
-        context_map, context_info = generate_sa_lut_context_map(src_low, ref_low, weights, source_mask, device_name)
+        context_map, context_info = generate_sa_lut_context_map(src_base, ref_base, weights, source_mask, device_name)
     except Exception as exc:
         if device_name != "mps":
             raise
         warnings.append(f"SA-LUT MPS context generation failed ({exc}); retrying on CPU.")
         device_name = "cpu"
-        context_map, context_info = generate_sa_lut_context_map(src_low, ref_low, weights, source_mask, device_name)
+        context_map, context_info = generate_sa_lut_context_map(src_base, ref_base, weights, source_mask, device_name)
     lut, fit_info = fit_sa_lut(
-        src_low,
-        ref_low,
+        src_base,
+        ref_base,
         context_map,
         weights,
         getattr(args, "sa_lut_size", 17),
@@ -869,24 +816,22 @@ def sa_lut_global_color_transfer(
         getattr(args, "sa_lut_smooth", 0.75),
     )
     if not fit_info.get("enabled", False):
-        warnings.append("SA-LUT fitting skipped; falling back to legacy global color transfer.")
-        legacy, params = global_color_transfer(
-            src_canvas,
-            ref_canvas,
-            source_mask,
-            weights,
-            blur_sigma,
-            0.0,
-            args.min_luma_std_ratio,
-            args.global_chroma_mean_strength,
-            args.global_chroma_std_strength,
-            args.max_global_a_shift,
-            args.max_global_b_shift,
-            args.use_rgb_affine,
-            warnings,
-        )
-        params.update({"method": "legacy_lab", "fallback_reason": fit_info.get("fallback_reason", "sa_lut disabled")})
-        return legacy, params, context_map
+        reason = fit_info.get("fallback_reason", "insufficient trusted samples")
+        warnings.append(f"SA-LUT fitting skipped ({reason}); using source-preserving identity.")
+        params = {
+            "method": "sa_lut",
+            "enabled": False,
+            "fallback_reason": reason,
+            "selected_device": device_name,
+            "device_info": device_info,
+            "render_backend": selected_backend,
+            "render_backend_fallback_reason": backend_reason,
+            "lut_size": int(getattr(args, "sa_lut_size", 17)),
+            "context_bins": int(getattr(args, "sa_lut_context_bins", 2)),
+            "fit_sample_count": fit_info.get("fit_sample_count", 0),
+            "context_generator": context_info,
+        }
+        return src_canvas.copy(), params, context_map, src_base.copy()
 
     try:
         result = apply_sa_lut_torch(src_canvas, context_map, lut, source_mask, device_name)
@@ -896,6 +841,7 @@ def sa_lut_global_color_transfer(
         warnings.append(f"SA-LUT MPS LUT application failed ({exc}); retrying on CPU.")
         device_name = "cpu"
         result = apply_sa_lut_torch(src_canvas, context_map, lut, source_mask, device_name)
+    base_result = apply_sa_lut_torch(src_base, context_map, lut, source_mask, device_name)
     params = {
         "method": "sa_lut",
         "enabled": True,
@@ -911,119 +857,82 @@ def sa_lut_global_color_transfer(
         "active_context_max": fit_info.get("active_context_max", float(context_map.max())),
         "context_generator": context_info,
     }
-    return finite01(result), params, context_map
+    return finite01(result), params, context_map, finite01(base_result)
 
 
-def global_color_transfer(
-    src_canvas: np.ndarray,
-    ref_canvas: np.ndarray,
-    source_mask: np.ndarray,
-    weights: np.ndarray,
-    blur_sigma: float,
-    mean_trust: float,
-    min_luma_std_ratio: float,
-    global_chroma_mean_strength: float,
-    global_chroma_std_strength: float,
-    max_global_a_shift: float,
-    max_global_b_shift: float,
-    use_rgb_affine: bool,
-    warnings: List[str],
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    src_low = mask_aware_blur(src_canvas, source_mask, blur_sigma)
-    ref_low = mask_aware_blur(ref_canvas, (weights > 0).astype(np.float32), blur_sigma)
-    src_fit, space = rgb_to_lab(src_low)
-    ref_fit, _ = rgb_to_lab(ref_low)
-    wsum = float(weights.sum())
-    if wsum < 100.0:
-        warnings.append("Trusted overlap is tiny; global correction is disabled.")
-        params = {
-            "space": space,
-            "enabled": False,
-            "strength": 0.0,
-            "src_chroma_mean": [0.0, 0.0],
-            "ref_chroma_mean": [0.0, 0.0],
-            "chroma_scale": [1.0, 1.0],
-            "chroma_offset": [0.0, 0.0],
-            "luma_curve": None,
-            "rgb_affine_used": bool(use_rgb_affine),
-        }
-        return src_canvas.copy(), params
-
-    luma_curve = fit_luminance_tone_curve(src_fit[..., 0], ref_fit[..., 0], weights, min_luma_std_ratio)
-    src_mean_ab, src_std_ab = weighted_mean_std(src_fit[..., 1:3], weights)
-    ref_mean_ab, ref_std_ab = weighted_mean_std(ref_fit[..., 1:3], weights)
-    mean_strength = float(np.clip(global_chroma_mean_strength, 0.0, 1.0))
-    std_strength = float(np.clip(global_chroma_std_strength, 0.0, 1.0))
-    max_shift = np.array([max_global_a_shift, max_global_b_shift], dtype=np.float32)
-    raw_scale_ab = np.clip(ref_std_ab / np.maximum(src_std_ab, 0.012), 0.75, 1.35)
-    scale_ab = 1.0 + (raw_scale_ab - 1.0) * std_strength
-    target_mean_ab = src_mean_ab + (ref_mean_ab - src_mean_ab) * mean_strength
-    offset_ab = np.clip(target_mean_ab - src_mean_ab * scale_ab, -max_shift, max_shift)
-    strength = 1.0 if mean_trust >= 0.22 else float(np.clip(0.35 + mean_trust, 0.25, 0.65))
-
-    src_full, _ = rgb_to_lab(src_canvas)
-    transformed = src_full.copy()
-    mapped_l = apply_luminance_curve(src_full[..., 0], luma_curve)
-    tone_strength = float(np.clip(0.70 + 0.25 * strength, 0.55, 0.95))
-    transformed[..., 0] = src_full[..., 0] * (1.0 - tone_strength) + mapped_l * tone_strength
-    chroma = src_full[..., 1:3] * scale_ab.reshape(1, 1, 2) + offset_ab.reshape(1, 1, 2)
-    transformed[..., 1:3] = src_full[..., 1:3] * (1.0 - strength) + chroma * strength
-    result = lab_to_rgb(transformed, space)
-    result = result * source_mask[..., None] + src_canvas * (1.0 - source_mask[..., None])
-    params = {
-        "space": space,
-        "enabled": True,
-        "strength": strength,
-        "tone_strength": tone_strength,
-        "global_chroma_mean_strength": mean_strength,
-        "global_chroma_std_strength": std_strength,
-        "max_global_a_shift": float(max_shift[0]),
-        "max_global_b_shift": float(max_shift[1]),
-        "src_chroma_mean": src_mean_ab.tolist(),
-        "ref_chroma_mean": ref_mean_ab.tolist(),
-        "src_chroma_std": src_std_ab.tolist(),
-        "ref_chroma_std": ref_std_ab.tolist(),
-        "target_chroma_mean": target_mean_ab.tolist(),
-        "raw_chroma_scale": raw_scale_ab.tolist(),
-        "chroma_scale": scale_ab.tolist(),
-        "chroma_offset": offset_ab.tolist(),
-        "rgb_affine_used": bool(use_rgb_affine),
-        "luma_curve": {
-            "quantiles": luma_curve["quantiles"].tolist(),
-            "src_quantiles": luma_curve["src_quantiles"].tolist(),
-            "ref_quantiles": luma_curve["ref_quantiles"].tolist(),
-            "src_std": luma_curve["src_std"],
-            "ref_std": luma_curve["ref_std"],
-        },
-    }
-    return finite01(result), params
+def smooth_residual_grid(values: np.ndarray, confidence: np.ndarray, sigma: float) -> np.ndarray:
+    if sigma <= 0:
+        return values.astype(np.float32, copy=True)
+    if ndimage is not None:
+        den = ndimage.gaussian_filter(confidence.astype(np.float32), sigma=sigma, mode="nearest")
+        if values.ndim == 2:
+            num = ndimage.gaussian_filter(values.astype(np.float32) * confidence, sigma=sigma, mode="nearest")
+            return (num / np.maximum(den, EPS)).astype(np.float32)
+        out = np.zeros_like(values, dtype=np.float32)
+        for c in range(values.shape[-1]):
+            num = ndimage.gaussian_filter(values[..., c].astype(np.float32) * confidence, sigma=sigma, mode="nearest")
+            out[..., c] = num / np.maximum(den, EPS)
+        return out
+    if cv2 is not None:
+        den = cv2.GaussianBlur(confidence.astype(np.float32), (0, 0), sigmaX=sigma)
+        if values.ndim == 2:
+            num = cv2.GaussianBlur(values.astype(np.float32) * confidence, (0, 0), sigmaX=sigma)
+            return (num / np.maximum(den, EPS)).astype(np.float32)
+        num = cv2.GaussianBlur(values.astype(np.float32) * confidence[..., None], (0, 0), sigmaX=sigma)
+        return (num / np.maximum(den[..., None], EPS)).astype(np.float32)
+    return values.astype(np.float32, copy=True)
 
 
-def compute_local_field(
-    global_result: np.ndarray,
-    ref_canvas: np.ndarray,
+def resize_map(arr: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+    h, w = shape
+    if cv2 is not None:
+        interp = cv2.INTER_CUBIC if arr.ndim == 2 else cv2.INTER_CUBIC
+        return cv2.resize(arr.astype(np.float32), (w, h), interpolation=interp).astype(np.float32)
+    if ndimage is None:
+        raise RuntimeError("Map resizing requires OpenCV or SciPy.")
+    zoom_y = h / arr.shape[0]
+    zoom_x = w / arr.shape[1]
+    if arr.ndim == 2:
+        return ndimage.zoom(arr.astype(np.float32), (zoom_y, zoom_x), order=3)[:h, :w].astype(np.float32)
+    return ndimage.zoom(arr.astype(np.float32), (zoom_y, zoom_x, 1), order=3)[:h, :w].astype(np.float32)
+
+
+def residual_map_visual(value: np.ndarray, center: float, span: float) -> np.ndarray:
+    return np.clip(0.5 + (value.astype(np.float32) - center) / max(span, EPS), 0.0, 1.0).astype(np.float32)
+
+
+def compute_local_residual_maps(
+    sa_lut_base_result: np.ndarray,
+    sa_lut_result: np.ndarray,
+    reference_base: np.ndarray,
     source_mask: np.ndarray,
     trusted_weights: np.ndarray,
-    grid: int,
-    blur_sigma: float,
-    local_luma_strength: float,
+    residual_grid: int,
+    residual_smooth: float,
+    min_luma_gain: float,
+    max_luma_gain: float,
+    max_luma_offset: float,
+    max_chroma_residual: float,
     warnings: List[str],
-) -> Tuple[np.ndarray, np.ndarray, bool]:
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     h, w = source_mask.shape
     if trusted_weights.sum() < 100.0:
-        warnings.append("Local correction skipped: insufficient trusted support.")
-        return np.zeros_like(global_result), global_result.copy(), False
+        warnings.append("Residual local matching skipped: insufficient trusted support.")
+        maps = {
+            "luma_gain": np.ones((h, w), dtype=np.float32),
+            "luma_offset": np.zeros((h, w), dtype=np.float32),
+            "chroma_delta": np.zeros((h, w, 2), dtype=np.float32),
+            "confidence": np.zeros((h, w), dtype=np.float32),
+        }
+        return maps, {"enabled": False, "reason": "insufficient trusted support"}
 
-    global_low = mask_aware_blur(global_result, source_mask, blur_sigma)
-    ref_low = mask_aware_blur(ref_canvas, (trusted_weights > 0).astype(np.float32), blur_sigma)
-    global_fit, space = rgb_to_lab(global_low)
-    ref_fit, _ = rgb_to_lab(ref_low)
-    delta = ref_fit - global_fit
-    delta[..., 0] = np.clip(delta[..., 0] * float(np.clip(local_luma_strength, 0.0, 1.0)), -0.06, 0.06)
-    delta[..., 1:3] = np.clip(delta[..., 1:3], -0.14, 0.14)
-    gy = max(2, int(grid))
-    gx = max(2, int(round(grid * w / max(h, 1))))
-    field_grid = np.zeros((gy, gx, 3), dtype=np.float32)
+    base_lab, space = rgb_to_lab(sa_lut_base_result)
+    ref_lab, _ = rgb_to_lab(reference_base)
+    gy = max(2, int(residual_grid))
+    gx = max(2, int(round(residual_grid * w / max(h, 1))))
+    gain_grid = np.ones((gy, gx), dtype=np.float32)
+    offset_grid = np.zeros((gy, gx), dtype=np.float32)
+    chroma_grid = np.zeros((gy, gx, 2), dtype=np.float32)
     conf_grid = np.zeros((gy, gx), dtype=np.float32)
 
     for iy in range(gy):
@@ -1036,54 +945,150 @@ def compute_local_field(
             total = float(ww.sum())
             if total < 12.0:
                 continue
-            dd = delta[y0:y1, x0:x1]
-            field_grid[iy, ix] = (dd * ww[..., None]).sum(axis=(0, 1)) / max(total, EPS)
+            src_l = base_lab[y0:y1, x0:x1, 0].astype(np.float64)
+            ref_l = ref_lab[y0:y1, x0:x1, 0].astype(np.float64)
+            w64 = ww.astype(np.float64)
+            mean_src = float((src_l * w64).sum() / max(total, EPS))
+            mean_ref = float((ref_l * w64).sum() / max(total, EPS))
+            var_src = float(((src_l - mean_src) ** 2 * w64).sum() / max(total, EPS))
+            cov = float(((src_l - mean_src) * (ref_l - mean_ref) * w64).sum() / max(total, EPS))
+            regression_gain = cov / max(var_src, 2e-4)
+            mean_gain = mean_ref / max(mean_src, 0.03)
+            gain = 0.35 * regression_gain + 0.65 * mean_gain
+            gain = float(np.clip(gain, min_luma_gain, max_luma_gain))
+            offset = float(np.clip(mean_ref - gain * mean_src, -max_luma_offset, max_luma_offset))
+            gain_grid[iy, ix] = gain
+            offset_grid[iy, ix] = offset
+            delta_ab = ref_lab[y0:y1, x0:x1, 1:3] - base_lab[y0:y1, x0:x1, 1:3]
+            chroma_grid[iy, ix] = np.clip((delta_ab * ww[..., None]).sum(axis=(0, 1)) / max(total, EPS), -max_chroma_residual, max_chroma_residual)
             conf_grid[iy, ix] = min(1.0, total / max(50.0, float((y1 - y0) * (x1 - x0)) * 0.08))
 
     if float(conf_grid.sum()) < 1.0:
-        warnings.append("Local correction skipped: no reliable grid cells.")
-        return np.zeros_like(global_result), global_result.copy(), False
+        warnings.append("Residual local matching skipped: no reliable grid cells.")
+        maps = {
+            "luma_gain": np.ones((h, w), dtype=np.float32),
+            "luma_offset": np.zeros((h, w), dtype=np.float32),
+            "chroma_delta": np.zeros((h, w, 2), dtype=np.float32),
+            "confidence": np.zeros((h, w), dtype=np.float32),
+        }
+        return maps, {"enabled": False, "reason": "no reliable grid cells"}
 
-    if ndimage is not None:
-        smooth_sigma = max(0.65, grid / 20.0)
-        den = ndimage.gaussian_filter(conf_grid, sigma=smooth_sigma, mode="nearest")
-        smoothed = np.zeros_like(field_grid)
-        for c in range(3):
-            num = ndimage.gaussian_filter(field_grid[..., c] * conf_grid, sigma=smooth_sigma, mode="nearest")
-            smoothed[..., c] = num / np.maximum(den, EPS)
-        field_grid = smoothed
-    elif cv2 is not None:
-        conf3 = conf_grid[..., None]
-        num = cv2.GaussianBlur(field_grid * conf3, (0, 0), sigmaX=1.0)
-        den = cv2.GaussianBlur(conf_grid, (0, 0), sigmaX=1.0)
-        field_grid = num / np.maximum(den[..., None], EPS)
+    smooth_sigma = max(0.0, float(residual_smooth))
+    gain_grid = smooth_residual_grid(gain_grid, conf_grid, smooth_sigma)
+    offset_grid = smooth_residual_grid(offset_grid, conf_grid, smooth_sigma)
+    chroma_grid = smooth_residual_grid(chroma_grid, conf_grid, smooth_sigma)
+    conf_grid = np.clip(smooth_residual_grid(conf_grid, conf_grid, smooth_sigma), 0.0, 1.0)
 
-    if cv2 is not None:
-        field = cv2.resize(field_grid, (w, h), interpolation=cv2.INTER_CUBIC).astype(np.float32)
-    else:
-        zoom_y = h / field_grid.shape[0]
-        zoom_x = w / field_grid.shape[1]
-        field = ndimage.zoom(field_grid, (zoom_y, zoom_x, 1), order=3)[:h, :w].astype(np.float32)
+    gain = np.clip(resize_map(gain_grid, (h, w)), min_luma_gain, max_luma_gain)
+    offset = np.clip(resize_map(offset_grid, (h, w)), -max_luma_offset, max_luma_offset)
+    chroma = np.clip(resize_map(chroma_grid, (h, w)), -max_chroma_residual, max_chroma_residual)
+    confidence = np.clip(resize_map(conf_grid, (h, w)), 0.0, 1.0)
 
-    lum = luminance(global_result)
+    lum = luminance(sa_lut_result)
     sx, sy = sobel_xy(mask_aware_blur(lum, source_mask, 1.0))
     edge = np.sqrt(sx * sx + sy * sy)
     edge_ref = float(np.percentile(edge[source_mask > 0.5], 95)) if np.any(source_mask > 0.5) else 0.0
     edge_gate = 1.0 - 0.55 * np.clip(edge / max(edge_ref, 0.03), 0.0, 1.0)
-    field = field * edge_gate[..., None] * source_mask[..., None]
-    field[..., 0] = np.clip(field[..., 0], -0.06, 0.06)
-    field[..., 1:3] = np.clip(field[..., 1:3], -0.14, 0.14)
-    global_full, _ = rgb_to_lab(global_result)
-    local_result = lab_to_rgb(global_full + field, space)
-    local_result = local_result * source_mask[..., None] + global_result * (1.0 - source_mask[..., None])
-    rgb_field = local_result - global_result
-    return rgb_field.astype(np.float32), finite01(local_result), True
+    src_sat = sa_lut_result.max(axis=-1) - sa_lut_result.min(axis=-1)
+    neutral_gate = 1.0 - 0.85 * np.clip((0.13 - src_sat) / 0.13, 0.0, 1.0)
+    confidence = confidence * edge_gate * source_mask
+    chroma = chroma * neutral_gate[..., None]
+
+    maps = {
+        "luma_gain": gain.astype(np.float32),
+        "luma_offset": offset.astype(np.float32),
+        "chroma_delta": chroma.astype(np.float32),
+        "confidence": confidence.astype(np.float32),
+    }
+    stats = {
+        "enabled": True,
+        "space": space,
+        "grid": [gy, gx],
+        "confidence_mean": float(confidence[source_mask > 0.5].mean()) if np.any(source_mask > 0.5) else 0.0,
+        "confidence_max": float(confidence.max()),
+        "luma_gain_min": float(gain.min()),
+        "luma_gain_max": float(gain.max()),
+        "luma_offset_min": float(offset.min()),
+        "luma_offset_max": float(offset.max()),
+        "max_abs_chroma_residual": float(np.max(np.abs(chroma))),
+    }
+    return maps, stats
 
 
-def apply_detail_preservation(src: np.ndarray, transferred: np.ndarray, mask: np.ndarray, blur_sigma: float, detail_strength: float) -> np.ndarray:
+def torch_rgb_to_lab_norm(rgb: Any) -> Any:
+    rgb = torch.clamp(rgb, 0.0, 1.0)
+    linear = torch.where(rgb <= 0.04045, rgb / 12.92, torch.pow((rgb + 0.055) / 1.055, 2.4))
+    x = linear[..., 0] * 0.4124564 + linear[..., 1] * 0.3575761 + linear[..., 2] * 0.1804375
+    y = linear[..., 0] * 0.2126729 + linear[..., 1] * 0.7151522 + linear[..., 2] * 0.0721750
+    z = linear[..., 0] * 0.0193339 + linear[..., 1] * 0.1191920 + linear[..., 2] * 0.9503041
+    xyz = torch.stack([x / 0.95047, y, z / 1.08883], dim=-1)
+    delta = 6.0 / 29.0
+    f = torch.where(xyz > delta**3, torch.pow(torch.clamp(xyz, min=EPS), 1.0 / 3.0), xyz / (3.0 * delta * delta) + 4.0 / 29.0)
+    l = (116.0 * f[..., 1] - 16.0) / 100.0
+    a = (500.0 * (f[..., 0] - f[..., 1]) + 128.0) / 255.0
+    b = (200.0 * (f[..., 1] - f[..., 2]) + 128.0) / 255.0
+    return torch.stack([l, a, b], dim=-1)
+
+
+def torch_lab_norm_to_rgb(lab_norm: Any) -> Any:
+    l = lab_norm[..., 0] * 100.0
+    a = lab_norm[..., 1] * 255.0 - 128.0
+    b = lab_norm[..., 2] * 255.0 - 128.0
+    fy = (l + 16.0) / 116.0
+    fx = fy + a / 500.0
+    fz = fy - b / 200.0
+    delta = 6.0 / 29.0
+
+    def finv(t: Any) -> Any:
+        return torch.where(t > delta, t * t * t, 3.0 * delta * delta * (t - 4.0 / 29.0))
+
+    x = finv(fx) * 0.95047
+    y = finv(fy)
+    z = finv(fz) * 1.08883
+    r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314
+    g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560
+    bl = x * 0.0556434 + y * -0.2040259 + z * 1.0572252
+    linear = torch.stack([r, g, bl], dim=-1)
+    srgb = torch.where(linear <= 0.0031308, linear * 12.92, 1.055 * torch.pow(torch.clamp(linear, min=0.0), 1.0 / 2.4) - 0.055)
+    return torch.clamp(srgb, 0.0, 1.0)
+
+
+def apply_residual_maps_torch(
+    sa_lut_result: np.ndarray,
+    source_mask: np.ndarray,
+    maps: Dict[str, np.ndarray],
+    local_strength: float,
+    local_luma_strength: float,
+    device_name: str,
+) -> Tuple[np.ndarray, str]:
+    if torch is None:
+        return sa_lut_result.copy(), "none"
+    if device_name == "none":
+        device_name = "cpu"
+    device = torch.device(device_name)
+    rgb = torch.from_numpy(finite01(sa_lut_result)).to(device=device, dtype=torch.float32)
+    mask = torch.from_numpy(np.clip(source_mask, 0.0, 1.0).astype(np.float32)).to(device=device)
+    gain = torch.from_numpy(maps["luma_gain"].astype(np.float32)).to(device=device)
+    offset = torch.from_numpy(maps["luma_offset"].astype(np.float32)).to(device=device)
+    chroma = torch.from_numpy(maps["chroma_delta"].astype(np.float32)).to(device=device)
+    conf = torch.from_numpy(np.clip(maps["confidence"], 0.0, 1.0).astype(np.float32)).to(device=device)
+    blend = torch.clamp(conf * float(np.clip(local_strength, 0.0, 1.0)) * mask, 0.0, 1.0)
+    luma_strength = float(np.clip(local_luma_strength, 0.0, 1.0))
+
+    lab = torch_rgb_to_lab_norm(rgb)
+    adjusted = lab.clone()
+    adjusted[..., 0] = torch.clamp(lab[..., 0] * (1.0 + (gain - 1.0) * luma_strength) + offset * luma_strength, 0.0, 1.0)
+    adjusted[..., 1:3] = torch.clamp(lab[..., 1:3] + chroma, 0.0, 1.0)
+    out_lab = lab * (1.0 - blend.unsqueeze(-1)) + adjusted * blend.unsqueeze(-1)
+    out = torch_lab_norm_to_rgb(out_lab)
+    out = out * mask.unsqueeze(-1) + rgb * (1.0 - mask.unsqueeze(-1))
+    return finite01(out.detach().cpu().numpy()), device_name
+
+
+def apply_detail_preservation(src: np.ndarray, transferred: np.ndarray, mask: np.ndarray, base_radius: float, detail_strength: float) -> np.ndarray:
     src_l = luminance(src)
     tr_l = luminance(transferred)
-    detail_sigma = max(1.0, blur_sigma * 0.33)
+    detail_sigma = max(1.0, base_radius * 0.33)
     src_base = mask_aware_blur(src_l, mask, detail_sigma)
     tr_base = mask_aware_blur(tr_l, mask, detail_sigma)
     source_detail_ratio = np.clip((src_l + 0.025) / (src_base + 0.025), 0.55, 1.80)
@@ -1158,11 +1163,11 @@ def anti_fade_guard(
     out_l = luminance(out)
     src_l_std = masked_std(src_l, mask)
     out_l_std = masked_std(out_l, mask)
-    target_l_std = src_l_std * float(max(0.0, min_luma_std_ratio)) * 1.02
+    target_l_std = src_l_std * float(max(0.0, min_luma_std_ratio)) * 1.045
     luma_boost = 1.0
     guarded = out.copy()
     if guard_strength > 0.0 and src_l_std > EPS and out_l_std + EPS < target_l_std:
-        luma_boost = float(np.clip(target_l_std / max(out_l_std, 0.01), 1.0, 1.75))
+        luma_boost = float(np.clip(target_l_std / max(out_l_std, 0.01), 1.0, 1.85))
         mean_l = masked_mean(out_l, mask)
         restored_l = np.clip(mean_l + (out_l - mean_l) * luma_boost, 0.0, 1.0)
         restored_l = out_l * (1.0 - guard_strength) + restored_l * guard_strength
@@ -1246,8 +1251,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--align", choices=["auto", "identity", "center"], default="auto", help="Alignment mode.")
     parser.add_argument("--align-scale-min", type=float, default=0.25, help="Minimum accepted similarity scale.")
     parser.add_argument("--align-scale-max", type=float, default=8.0, help="Maximum accepted similarity scale.")
-    parser.add_argument("--grid", type=int, default=16, help="Approximate local correction grid rows.")
-    parser.add_argument("--blur-sigma", type=float, default=24.0, help="Low-frequency Gaussian sigma.")
+    parser.add_argument("--residual-grid", type=int, default=16, help="Approximate residual map grid rows.")
+    parser.add_argument("--base-radius", type=float, default=24.0, help="Edge-aware base smoothing radius.")
+    parser.add_argument("--base-filter", choices=["guided_auto", "bilateral", "gaussian"], default="guided_auto", help="Low-frequency base filter.")
+    parser.add_argument("--base-filter-eps", type=float, default=0.01, help="Edge-aware base filter range parameter.")
     parser.add_argument("--local-strength", type=float, default=0.65, help="Local correction blend strength.")
     parser.add_argument("--local-luma-strength", type=float, default=0.25, help="Strength for local luminance correction; chroma local correction is unaffected.")
     parser.add_argument("--detail-strength", type=float, default=1.0, help="Source detail restoration strength.")
@@ -1255,17 +1262,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-luma-std-ratio", type=float, default=0.85, help="Minimum output/source luminance std ratio enforced by anti-fade guard.")
     parser.add_argument("--min-saturation-ratio", type=float, default=0.80, help="Minimum output/source saturation ratio enforced by anti-fade guard.")
     parser.add_argument("--anti-fade-strength", type=float, default=1.0, help="Strength for final contrast and saturation anti-fade guard.")
-    parser.add_argument("--global-chroma-mean-strength", type=float, default=0.35, help="Blend strength for global Lab a/b mean transfer.")
-    parser.add_argument("--global-chroma-std-strength", type=float, default=0.65, help="Blend strength for global Lab a/b std transfer.")
-    parser.add_argument("--max-global-a-shift", type=float, default=0.035, help="Maximum absolute global Lab a shift.")
-    parser.add_argument("--max-global-b-shift", type=float, default=0.045, help="Maximum absolute global Lab b shift.")
-    parser.add_argument("--use-rgb-affine", action="store_true", help="Enable optional RGB affine chroma correction.")
-    parser.add_argument("--global-match-method", choices=["sa_lut", "legacy_lab"], default="sa_lut", help="Global match method.")
+    parser.add_argument("--pipeline-version", choices=["v0_2_5"], default="v0_2_5", help="LookAlign pipeline version.")
     parser.add_argument("--sa-lut-size", type=int, default=17, help="SA-LUT RGB lattice resolution.")
     parser.add_argument("--sa-lut-context-bins", type=int, default=2, help="SA-LUT context bin count.")
     parser.add_argument("--sa-lut-fit-max-samples", type=int, default=250000, help="Maximum trusted samples used for SA-LUT fitting.")
     parser.add_argument("--sa-lut-ridge", type=float, default=0.035, help="Ridge term for sparse SA-LUT cells.")
     parser.add_argument("--sa-lut-smooth", type=float, default=0.75, help="Gaussian smoothing sigma for fitted SA-LUT residuals.")
+    parser.add_argument("--residual-smooth", type=float, default=0.75, help="Gaussian smoothing sigma for residual maps.")
+    parser.add_argument("--min-luma-gain", type=float, default=0.65, help="Minimum residual luminance gain.")
+    parser.add_argument("--max-luma-gain", type=float, default=1.45, help="Maximum residual luminance gain.")
+    parser.add_argument("--max-luma-offset", type=float, default=0.12, help="Maximum residual luminance offset.")
+    parser.add_argument("--max-chroma-residual", type=float, default=0.14, help="Maximum residual Lab chroma delta.")
     parser.add_argument("--render-backend", choices=["auto", "pytorch", "numpy", "opencv", "coreimage", "accelerate"], default="auto", help="Rendering backend preference.")
     return parser.parse_args()
 
@@ -1276,8 +1283,11 @@ def lookalign_defaults() -> Dict[str, Any]:
         "align": "auto",
         "align_scale_min": 0.25,
         "align_scale_max": 8.0,
-        "grid": 16,
-        "blur_sigma": 24.0,
+        "pipeline_version": "v0_2_5",
+        "residual_grid": 16,
+        "base_radius": 24.0,
+        "base_filter": "guided_auto",
+        "base_filter_eps": 0.01,
         "local_strength": 0.65,
         "local_luma_strength": 0.25,
         "detail_strength": 1.0,
@@ -1285,17 +1295,16 @@ def lookalign_defaults() -> Dict[str, Any]:
         "min_luma_std_ratio": 0.85,
         "min_saturation_ratio": 0.80,
         "anti_fade_strength": 1.0,
-        "global_chroma_mean_strength": 0.35,
-        "global_chroma_std_strength": 0.65,
-        "max_global_a_shift": 0.035,
-        "max_global_b_shift": 0.045,
-        "use_rgb_affine": False,
-        "global_match_method": "sa_lut",
         "sa_lut_size": 17,
         "sa_lut_context_bins": 2,
         "sa_lut_fit_max_samples": 250000,
         "sa_lut_ridge": 0.035,
         "sa_lut_smooth": 0.75,
+        "residual_smooth": 0.75,
+        "min_luma_gain": 0.65,
+        "max_luma_gain": 1.45,
+        "max_luma_offset": 0.12,
+        "max_chroma_residual": 0.14,
         "render_backend": "auto",
     }
 
@@ -1350,8 +1359,8 @@ def run_lookalign(
     if overlap_ratio < 0.02:
         warnings.append("Reference overlap with source is tiny; output will stay close to source.")
 
-    source_low = mask_aware_blur(source_canvas, source_mask, args.blur_sigma)
-    reference_low = mask_aware_blur(reference_canvas, reference_mask, args.blur_sigma)
+    source_base, source_base_info = make_edge_aware_base(source_canvas, source_mask, args.base_radius, args.base_filter_eps, args.base_filter)
+    reference_base, reference_base_info = make_edge_aware_base(reference_canvas, reference_mask, args.base_radius, args.base_filter_eps, args.base_filter)
     trust = compute_trust(source_canvas, reference_canvas, overlap) if overlap.sum() > 0 else np.zeros_like(overlap)
     mean_trust = float(trust[overlap > 0.5].mean()) if np.any(overlap > 0.5) else 0.0
     trusted = trust * overlap
@@ -1372,50 +1381,54 @@ def run_lookalign(
     if align_conf < 0.25:
         local_strength = min(local_strength, 0.25)
 
-    sa_lut_context_map: Optional[np.ndarray] = None
-    if str(getattr(args, "global_match_method", "sa_lut")) == "legacy_lab":
-        global_result, global_params = global_color_transfer(
-            source_canvas,
-            reference_canvas,
-            source_mask,
-            fit_weights,
-            args.blur_sigma,
-            mean_trust,
-            args.min_luma_std_ratio,
-            args.global_chroma_mean_strength,
-            args.global_chroma_std_strength,
-            args.max_global_a_shift,
-            args.max_global_b_shift,
-            args.use_rgb_affine,
-            warnings,
-        )
-        global_params["method"] = "legacy_lab"
-    else:
-        global_result, global_params, sa_lut_context_map = sa_lut_global_color_transfer(
-            source_canvas,
-            reference_canvas,
-            source_mask,
-            fit_weights,
-            args.blur_sigma,
-            args,
-            warnings,
-        )
-
-    field, local_unblended, local_enabled = compute_local_field(
-        global_result,
-        reference_canvas,
+    sa_lut_base_result, global_params, sa_lut_context_map, sa_lut_base_low = sa_lut_global_color_transfer(
+        source_canvas,
+        source_base,
+        reference_base,
         source_mask,
         fit_weights,
-        args.grid,
-        args.blur_sigma,
-        args.local_luma_strength,
+        args,
         warnings,
     )
-    local_result = finite01(global_result * (1.0 - local_strength) + local_unblended * local_strength)
-    if not local_enabled:
-        local_result = global_result
 
-    detailed = apply_detail_preservation(source_canvas, local_result, source_mask, args.blur_sigma, args.detail_strength)
+    residual_maps, residual_stats = compute_local_residual_maps(
+        sa_lut_base_low,
+        sa_lut_base_result,
+        reference_base,
+        source_mask,
+        fit_weights,
+        args.residual_grid,
+        args.residual_smooth,
+        args.min_luma_gain,
+        args.max_luma_gain,
+        args.max_luma_offset,
+        args.max_chroma_residual,
+        warnings,
+    )
+    residual_device = str(global_params.get("selected_device", "cpu"))
+    try:
+        local_result, residual_device = apply_residual_maps_torch(
+            sa_lut_base_result,
+            source_mask,
+            residual_maps,
+            local_strength if residual_stats.get("enabled", False) else 0.0,
+            args.local_luma_strength,
+            residual_device,
+        )
+    except Exception as exc:
+        if residual_device != "mps":
+            raise
+        warnings.append(f"Residual map MPS application failed ({exc}); retrying on CPU.")
+        local_result, residual_device = apply_residual_maps_torch(
+            sa_lut_base_result,
+            source_mask,
+            residual_maps,
+            local_strength if residual_stats.get("enabled", False) else 0.0,
+            args.local_luma_strength,
+            "cpu",
+        )
+
+    detailed = apply_detail_preservation(source_canvas, local_result, source_mask, args.base_radius, args.detail_strength)
     protected = protect_output(source_canvas, detailed, source_mask)
     guarded, guard_metrics = anti_fade_guard(
         source_canvas,
@@ -1432,9 +1445,9 @@ def run_lookalign(
     output = finite01(output)
     save_rgb(args.output, output)
 
-    field_vis = np.clip(0.5 + field / 0.36, 0.0, 1.0)
     aligned_ref_vis = reference_canvas * reference_mask[..., None] + (1.0 - reference_mask[..., None])
     debug_data = {
+        "pipeline_version": "v0_2_5",
         "source_shape": list(src.shape),
         "reference_shape": list(ref.shape),
         "estimated_transform": matrix.astype(float).tolist(),
@@ -1446,29 +1459,35 @@ def run_lookalign(
         "mean_trust": mean_trust,
         "trusted_pixel_count": trusted_count,
         "global_fit_parameters": global_params,
+        "base_filter": {"source": source_base_info, "reference": reference_base_info},
+        "residual_fit_parameters": residual_stats,
+        "residual_device": residual_device,
         "chroma_transfer_metrics": chroma_metrics,
-        "local_strength_used": float(local_strength if local_enabled else 0.0),
+        "local_strength_used": float(local_strength if residual_stats.get("enabled", False) else 0.0),
         "local_luma_strength": float(args.local_luma_strength),
         "anti_fade_guard": guard_metrics,
         "warnings": warnings,
     }
     debug_images = {
         "aligned_reference": aligned_ref_vis,
-        "source_lowfreq": finite01(source_low),
-        "reference_lowfreq": finite01(reference_low),
-        "global_result": finite01(global_result),
-        "local_field_visualization": field_vis,
+        "source_base": finite01(source_base),
+        "reference_base": finite01(reference_base),
+        "sa_lut_base_result": finite01(sa_lut_base_result),
         "local_result": finite01(local_result),
+        "local_residual_result": finite01(local_result),
         "final_output": output,
     }
     debug_masks = {
         "reference_valid_mask": reference_mask,
         "overlap_mask": overlap,
         "trust_map": trust,
+        "sa_lut_context_map": np.clip(sa_lut_context_map, 0.0, 1.0).astype(np.float32),
+        "residual_luma_gain": residual_map_visual(residual_maps["luma_gain"], 1.0, max(args.max_luma_gain - 1.0, 1.0 - args.min_luma_gain)),
+        "residual_luma_offset": residual_map_visual(residual_maps["luma_offset"], 0.0, args.max_luma_offset * 2.0),
+        "residual_chroma_a": residual_map_visual(residual_maps["chroma_delta"][..., 0], 0.0, args.max_chroma_residual * 2.0),
+        "residual_chroma_b": residual_map_visual(residual_maps["chroma_delta"][..., 1], 0.0, args.max_chroma_residual * 2.0),
+        "residual_confidence": np.clip(residual_maps["confidence"], 0.0, 1.0).astype(np.float32),
     }
-    if sa_lut_context_map is not None:
-        debug_images["sa_lut_global_result"] = finite01(global_result)
-        debug_masks["sa_lut_context_map"] = np.clip(sa_lut_context_map, 0.0, 1.0).astype(np.float32)
 
     write_debug(
         args.debug_dir,
@@ -1482,18 +1501,22 @@ def run_lookalign(
         debug_dir = Path(args.debug_dir)
         debug_names = [
             "aligned_reference",
-            "source_lowfreq",
-            "reference_lowfreq",
-            "global_result",
-            "local_field_visualization",
+            "source_base",
+            "reference_base",
+            "sa_lut_base_result",
             "local_result",
+            "local_residual_result",
             "final_output",
             "reference_valid_mask",
             "overlap_mask",
             "trust_map",
+            "sa_lut_context_map",
+            "residual_luma_gain",
+            "residual_luma_offset",
+            "residual_chroma_a",
+            "residual_chroma_b",
+            "residual_confidence",
         ]
-        if sa_lut_context_map is not None:
-            debug_names.extend(["sa_lut_global_result", "sa_lut_context_map"])
         for name in debug_names:
             debug_paths[name] = str(debug_dir / f"{name}.png")
         debug_paths["debug_json"] = str(debug_dir / "debug.json")

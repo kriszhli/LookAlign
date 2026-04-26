@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Gradio UI for the LookAlign MVP."""
+"""Local Gradio UI for LookAlign V0.2.5."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ DEFAULT_SOURCE = ROOT / "inputs" / "source.png"
 DEFAULT_REFERENCE = ROOT / "inputs" / "reference.png"
 OUTPUTS_DIR = ROOT / "outputs"
 
-IMAGE_OPTIONS = ["Source", "Aligned Reference", "LookAlign Output"]
+IMAGE_OPTIONS = ["Source", "Aligned Reference", "SA-LUT Base", "Local Residual Result", "LookAlign Output"]
 
 
 def existing_path(path: Path) -> Optional[str]:
@@ -44,8 +44,8 @@ def run_ui(
     local_strength: float,
     local_luma_strength: float,
     detail_strength: float,
-    blur_sigma: float,
-    grid: int,
+    base_radius: float,
+    residual_grid: int,
     trust_threshold: float,
     min_luma_std_ratio: float,
     min_saturation_ratio: float,
@@ -66,8 +66,8 @@ def run_ui(
         "local_strength": float(local_strength),
         "local_luma_strength": float(local_luma_strength),
         "detail_strength": float(detail_strength),
-        "blur_sigma": float(blur_sigma),
-        "grid": int(grid),
+        "base_radius": float(base_radius),
+        "residual_grid": int(residual_grid),
         "trust_threshold": float(trust_threshold),
         "min_luma_std_ratio": float(min_luma_std_ratio),
         "min_saturation_ratio": float(min_saturation_ratio),
@@ -79,15 +79,21 @@ def run_ui(
     paths = {
         "Source": source,
         "Aligned Reference": debug_paths.get("aligned_reference"),
+        "SA-LUT Base": debug_paths.get("sa_lut_base_result"),
+        "Local Residual Result": debug_paths.get("local_residual_result"),
         "LookAlign Output": result["output_path"],
     }
 
     return (
         build_comparison_value(paths, compare_a, compare_b),
         debug_paths.get("aligned_reference"),
-        debug_paths.get("source_lowfreq"),
-        debug_paths.get("reference_lowfreq"),
-        debug_paths.get("trust_map"),
+        debug_paths.get("source_base"),
+        debug_paths.get("reference_base"),
+        debug_paths.get("sa_lut_base_result"),
+        debug_paths.get("residual_luma_gain"),
+        debug_paths.get("residual_luma_offset"),
+        debug_paths.get("residual_chroma_a"),
+        debug_paths.get("residual_confidence"),
         result["output_path"],
         paths,
     )
@@ -105,8 +111,8 @@ def initial_paths() -> Dict[str, Optional[str]]:
 
 def build_app() -> gr.Blocks:
     defaults = initial_paths()
-    with gr.Blocks(title="LookAlign MVP") as demo:
-        gr.Markdown("# LookAlign MVP")
+    with gr.Blocks(title="LookAlign V0.2.5") as demo:
+        gr.Markdown("# LookAlign V0.2.5")
         state = gr.State(defaults)
 
         with gr.Row():
@@ -155,21 +161,21 @@ def build_app() -> gr.Blocks:
             )
 
         with gr.Row():
-            blur_sigma = gr.Slider(
+            base_radius = gr.Slider(
                 0.0,
                 80.0,
                 value=24.0,
                 step=1.0,
-                label="blur_sigma",
-                info="Blur radius used to compare broad color and lighting.",
+                label="base_radius",
+                info="Edge-aware base smoothing radius.",
             )
-            grid = gr.Slider(
+            residual_grid = gr.Slider(
                 2,
                 64,
                 value=16,
                 step=1,
-                label="grid",
-                info="Number of rows used for local correction patches.",
+                label="residual_grid",
+                info="Number of rows used for residual luminance and color maps.",
             )
             trust_threshold = gr.Slider(
                 0.0,
@@ -211,10 +217,10 @@ def build_app() -> gr.Blocks:
         with gr.Row():
             with gr.Column():
                 with gr.Row():
-                    compare_a = gr.Dropdown(IMAGE_OPTIONS, value="Aligned Reference", label="Comparison A")
+                    compare_a = gr.Dropdown(IMAGE_OPTIONS, value="SA-LUT Base", label="Comparison A")
                     compare_b = gr.Dropdown(IMAGE_OPTIONS, value="LookAlign Output", label="Comparison B")
                 comparison = gr.ImageSlider(
-                    value=build_comparison_value({"Source": defaults["Source"], "Aligned Reference": defaults["Reference"], "LookAlign Output": defaults["Reference"]}, "Aligned Reference", "LookAlign Output"),
+                    value=build_comparison_value({"Source": defaults["Source"], "Aligned Reference": defaults["Reference"], "SA-LUT Base": defaults["Reference"], "Local Residual Result": defaults["Reference"], "LookAlign Output": defaults["Reference"]}, "SA-LUT Base", "LookAlign Output"),
                     type="filepath",
                     label="Before / after comparison",
                     interactive=False,
@@ -223,9 +229,15 @@ def build_app() -> gr.Blocks:
 
         with gr.Row():
             aligned_reference = gr.Image(label="Aligned reference image", type="filepath")
-            source_lowfreq = gr.Image(label="Source low-frequency map", type="filepath")
-            reference_lowfreq = gr.Image(label="Reference low-frequency map", type="filepath")
-            trust_map = gr.Image(label="Trust map", type="filepath")
+            source_base = gr.Image(label="Source base", type="filepath")
+            reference_base = gr.Image(label="Reference base", type="filepath")
+            sa_lut_base = gr.Image(label="SA-LUT base result", type="filepath")
+
+        with gr.Row():
+            residual_luma_gain = gr.Image(label="Residual luminance gain", type="filepath")
+            residual_luma_offset = gr.Image(label="Residual luminance offset", type="filepath")
+            residual_chroma = gr.Image(label="Residual chroma A", type="filepath")
+            residual_confidence = gr.Image(label="Residual confidence", type="filepath")
 
         download = gr.File(label="Download output PNG")
 
@@ -238,8 +250,8 @@ def build_app() -> gr.Blocks:
                 local_strength,
                 local_luma_strength,
                 detail_strength,
-                blur_sigma,
-                grid,
+                base_radius,
+                residual_grid,
                 trust_threshold,
                 min_luma_std_ratio,
                 min_saturation_ratio,
@@ -250,9 +262,13 @@ def build_app() -> gr.Blocks:
             outputs=[
                 comparison,
                 aligned_reference,
-                source_lowfreq,
-                reference_lowfreq,
-                trust_map,
+                source_base,
+                reference_base,
+                sa_lut_base,
+                residual_luma_gain,
+                residual_luma_offset,
+                residual_chroma,
+                residual_confidence,
                 download,
                 state,
             ],

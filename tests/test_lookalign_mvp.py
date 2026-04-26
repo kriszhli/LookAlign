@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+import app
 from scripts import lookalign_mvp as la
 
 
@@ -49,8 +50,8 @@ class LookAlignAntiFadeTests(unittest.TestCase):
             save_image(ref_path, reference)
             run_config = {
                 "align": "identity",
-                "blur_sigma": 5.0,
-                "grid": 6,
+                "base_radius": 5.0,
+                "residual_grid": 6,
                 "trust_threshold": 0.0,
                 "debug_dir": None,
             }
@@ -91,13 +92,27 @@ class LookAlignAntiFadeTests(unittest.TestCase):
         mask = np.ones((size, size), dtype=np.float32)
         weights = np.ones((size, size), dtype=np.float32)
 
-        _, local_result, enabled = la.compute_local_field(source, ref, mask, weights, grid=4, blur_sigma=4.0, local_luma_strength=0.0, warnings=[])
+        maps, stats = la.compute_local_residual_maps(
+            source,
+            source,
+            ref,
+            mask,
+            weights,
+            residual_grid=4,
+            residual_smooth=0.4,
+            min_luma_gain=0.65,
+            max_luma_gain=1.45,
+            max_luma_offset=0.12,
+            max_chroma_residual=0.14,
+            warnings=[],
+        )
+        local_result, _ = la.apply_residual_maps_torch(source, mask, maps, local_strength=1.0, local_luma_strength=0.0, device_name="cpu")
 
         source_lab, _ = la.rgb_to_lab(source)
         local_lab, _ = la.rgb_to_lab(local_result)
         l_delta = np.abs(local_lab[..., 0] - source_lab[..., 0]).mean()
         ab_delta = np.abs(local_lab[..., 1:3] - source_lab[..., 1:3]).mean()
-        self.assertTrue(enabled)
+        self.assertTrue(stats["enabled"])
         self.assertLess(l_delta, 0.012)
         self.assertGreater(ab_delta, 0.004)
 
@@ -165,10 +180,11 @@ class LookAlignSALUTTests(unittest.TestCase):
             }
         )
 
-        matched, params, context = la.sa_lut_global_color_transfer(source, reference, weights, weights, 2.0, args, warnings)
+        matched, params, context, base_matched = la.sa_lut_global_color_transfer(source, source, reference, weights, weights, args, warnings)
 
         self.assertEqual(params["method"], "sa_lut")
         self.assertEqual(context.shape, weights.shape)
+        self.assertEqual(base_matched.shape, source.shape)
         before = float(np.mean((source - reference) ** 2))
         after = float(np.mean((matched - reference) ** 2))
         self.assertLess(after, before * 0.75)
@@ -181,12 +197,71 @@ class LookAlignSALUTTests(unittest.TestCase):
         warnings: list[str] = []
         args = la._config_to_namespace({"render_backend": "pytorch"})
 
-        matched, params, context = la.sa_lut_global_color_transfer(source, reference, np.ones((32, 32), dtype=np.float32), weights, 3.0, args, warnings)
+        matched, params, context, base_matched = la.sa_lut_global_color_transfer(source, source, reference, np.ones((32, 32), dtype=np.float32), weights, args, warnings)
 
         self.assertEqual(matched.shape, source.shape)
         self.assertEqual(context.shape, weights.shape)
-        self.assertEqual(params["method"], "legacy_lab")
+        self.assertEqual(base_matched.shape, source.shape)
+        self.assertEqual(params["method"], "sa_lut")
+        self.assertFalse(params["enabled"])
+        self.assertLess(float(np.mean(np.abs(matched - source))), 0.001)
         self.assertTrue(any("SA-LUT fitting skipped" in msg for msg in warnings))
+
+    def test_residual_maps_reduce_local_luminance_error(self) -> None:
+        size = 72
+        source = synthetic_source(size)
+        y, _ = np.mgrid[0:size, 0:size].astype(np.float32)
+        reference = np.clip(source * (0.80 + 0.35 * y[..., None] / max(size - 1, 1)), 0.0, 1.0)
+        mask = np.ones((size, size), dtype=np.float32)
+        weights = np.ones((size, size), dtype=np.float32)
+        maps, stats = la.compute_local_residual_maps(
+            source,
+            source,
+            reference,
+            mask,
+            weights,
+            residual_grid=6,
+            residual_smooth=0.5,
+            min_luma_gain=0.65,
+            max_luma_gain=1.45,
+            max_luma_offset=0.12,
+            max_chroma_residual=0.14,
+            warnings=[],
+        )
+        adjusted, _ = la.apply_residual_maps_torch(source, mask, maps, local_strength=1.0, local_luma_strength=1.0, device_name="cpu")
+        before = float(np.mean((la.luminance(source) - la.luminance(reference)) ** 2))
+        after = float(np.mean((la.luminance(adjusted) - la.luminance(reference)) ** 2))
+        self.assertTrue(stats["enabled"])
+        self.assertLess(after, before * 0.65)
+
+    def test_gradio_run_ui_returns_v025_debug_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_path = tmp_path / "source.png"
+            ref_path = tmp_path / "reference.png"
+            save_image(src_path, synthetic_source(48))
+            save_image(ref_path, warm_reference(48))
+            with mock.patch.object(app, "OUTPUTS_DIR", tmp_path / "outputs"):
+                result = app.run_ui(
+                    str(src_path),
+                    str(ref_path),
+                    "identity",
+                    0.4,
+                    0.25,
+                    1.0,
+                    6.0,
+                    4,
+                    0.0,
+                    0.85,
+                    0.80,
+                    1.0,
+                    "SA-LUT Base",
+                    "LookAlign Output",
+                )
+            paths = result[-1]
+            self.assertIn("SA-LUT Base", paths)
+            self.assertIn("Local Residual Result", paths)
+            self.assertTrue(Path(paths["SA-LUT Base"]).exists())
 
     @unittest.skipIf(la.torch is None, "PyTorch unavailable")
     def test_sa_lut_device_selector_prefers_mps_when_available(self) -> None:
