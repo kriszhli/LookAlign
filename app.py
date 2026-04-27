@@ -67,6 +67,12 @@ def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[s
         paths["luma_confidence"],
         paths["hue_confidence"],
         paths["chroma_confidence"],
+        paths["lightglue_matches"],
+        paths["filtered_match_confidence"],
+        paths["sparse_luma_delta"],
+        paths["sparse_hue_delta"],
+        paths["sparse_chroma_scale"],
+        paths["match_density"],
     )
 
 
@@ -101,6 +107,15 @@ def build_app() -> gr.Blocks:
             luma_confidence = gr.Image(label="Luma confidence", type="filepath")
             hue_confidence = gr.Image(label="Hue confidence", type="filepath")
             chroma_confidence = gr.Image(label="Chroma confidence", type="filepath")
+        with gr.Row():
+            lightglue_matches = gr.Image(label="LightGlue matches", type="filepath")
+            filtered_match_confidence = gr.Image(label="Filtered match confidence", type="filepath")
+        with gr.Row():
+            sparse_luma_delta = gr.Image(label="Sparse luma delta samples", type="filepath")
+            sparse_hue_delta = gr.Image(label="Sparse hue delta samples", type="filepath")
+            sparse_chroma_scale = gr.Image(label="Sparse chroma scale samples", type="filepath")
+        with gr.Row():
+            match_density = gr.Image(label="Match density", type="filepath")
 
         run_button.click(
             fn=run_ui,
@@ -120,6 +135,12 @@ def build_app() -> gr.Blocks:
                 luma_confidence,
                 hue_confidence,
                 chroma_confidence,
+                lightglue_matches,
+                filtered_match_confidence,
+                sparse_luma_delta,
+                sparse_hue_delta,
+                sparse_chroma_scale,
+                match_density,
             ],
             queue=True,
         )
