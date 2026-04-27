@@ -53,25 +53,15 @@ def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[s
     )
     paths = metrics["paths"]
     return (
+        paths["base_intermediate"],
         paths["final_output"],
+        paths["reference_resized"],
+        paths["lightglue_matches"],
+        paths["filtered_match_confidence"],
         paths["diffuse_luma_delta"],
         paths["diffuse_hue_delta"],
         paths["diffuse_chroma_scale"],
         paths["diffuse_confidence"],
-        paths["diffuse_residual_rejection"],
-        paths["ref_residual_confidence"],
-        paths["specular_confidence"],
-        paths["shadow_confidence"],
-        paths["hue_stability_confidence"],
-        paths["delta_sanity_confidence"],
-        paths["luma_confidence"],
-        paths["hue_confidence"],
-        paths["chroma_confidence"],
-        paths["lightglue_matches"],
-        paths["filtered_match_confidence"],
-        paths["sparse_luma_delta"],
-        paths["sparse_hue_delta"],
-        paths["sparse_chroma_scale"],
         paths["match_density"],
     )
 
@@ -86,60 +76,39 @@ def build_app() -> gr.Blocks:
 
         run_button = gr.Button("Run V0.3.6", variant="primary")
 
-        final_output = gr.Image(label="Final output", type="filepath")
+        gr.Markdown("## Outputs")
+        with gr.Row():
+            base_intermediate = gr.Image(label="Base intermediate (after 3D LUT)", type="filepath")
+            final_output = gr.Image(label="Final output", type="filepath")
 
-        gr.Markdown("## Local matching debug maps")
+        gr.Markdown("## Reference And Alignment")
+        with gr.Row():
+            reference_resized = gr.Image(label="Reference resized to base geometry", type="filepath")
+            lightglue_matches = gr.Image(label="LightGlue matches", type="filepath")
+            filtered_match_confidence = gr.Image(label="Aligned match confidence", type="filepath")
+
+        gr.Markdown("## Applied Local Maps")
         with gr.Row():
             diffuse_luma_delta = gr.Image(label="Diffuse luma delta", type="filepath")
             diffuse_hue_delta = gr.Image(label="Diffuse hue delta", type="filepath")
             diffuse_chroma_scale = gr.Image(label="Diffuse chroma scale", type="filepath")
         with gr.Row():
             diffuse_confidence = gr.Image(label="Diffuse confidence", type="filepath")
-            diffuse_residual_rejection = gr.Image(label="Diffuse residual rejection", type="filepath")
-        with gr.Row():
-            ref_residual_confidence = gr.Image(label="Reference residual confidence", type="filepath")
-            specular_confidence = gr.Image(label="Specular confidence", type="filepath")
-            shadow_confidence = gr.Image(label="Shadow confidence", type="filepath")
-        with gr.Row():
-            hue_stability_confidence = gr.Image(label="Hue stability confidence", type="filepath")
-            delta_sanity_confidence = gr.Image(label="Delta sanity confidence", type="filepath")
-        with gr.Row():
-            luma_confidence = gr.Image(label="Luma confidence", type="filepath")
-            hue_confidence = gr.Image(label="Hue confidence", type="filepath")
-            chroma_confidence = gr.Image(label="Chroma confidence", type="filepath")
-        with gr.Row():
-            lightglue_matches = gr.Image(label="LightGlue matches", type="filepath")
-            filtered_match_confidence = gr.Image(label="Aligned match confidence", type="filepath")
-        with gr.Row():
-            sparse_luma_delta = gr.Image(label="Luma delta diagnostic", type="filepath")
-            sparse_hue_delta = gr.Image(label="Hue delta diagnostic", type="filepath")
-            sparse_chroma_scale = gr.Image(label="Chroma scale diagnostic", type="filepath")
-        with gr.Row():
             match_density = gr.Image(label="Match density", type="filepath")
 
         run_button.click(
             fn=run_ui,
             inputs=[source_image, reference_image],
             outputs=[
+                base_intermediate,
                 final_output,
+                reference_resized,
+                lightglue_matches,
+                filtered_match_confidence,
                 diffuse_luma_delta,
                 diffuse_hue_delta,
                 diffuse_chroma_scale,
                 diffuse_confidence,
-                diffuse_residual_rejection,
-                ref_residual_confidence,
-                specular_confidence,
-                shadow_confidence,
-                hue_stability_confidence,
-                delta_sanity_confidence,
-                luma_confidence,
-                hue_confidence,
-                chroma_confidence,
-                lightglue_matches,
-                filtered_match_confidence,
-                sparse_luma_delta,
-                sparse_hue_delta,
-                sparse_chroma_scale,
                 match_density,
             ],
             queue=True,
