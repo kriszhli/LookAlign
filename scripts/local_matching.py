@@ -524,14 +524,38 @@ def aligned_proxy_delta_maps(
     aligned_ref_proxy, warp_valid = warp_reference_to_base(ref_proxy, matches["homography"], height, width)
     delta_maps = proxy_delta_maps(base_proxy, aligned_ref_proxy, cfg)
     aligned_ref_conf, _ = warp_reference_to_base(confidence["ref_residual_confidence"], matches["homography"], height, width)
+    aligned_specular_conf, _ = warp_reference_to_base(confidence["specular_confidence"], matches["homography"], height, width)
+    aligned_shadow_conf, _ = warp_reference_to_base(confidence["shadow_confidence"], matches["homography"], height, width)
     density = (warp_valid * aligned_ref_conf).clamp(0.0, 1.0)
     fallback = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
     blend = smoothstep(cfg.sparse_density_blend_low, cfg.sparse_density_blend_high, density)
+
+    base_chroma, base_hue = chroma_and_hue(base_proxy)
+    ref_chroma, ref_hue = chroma_and_hue(aligned_ref_proxy)
+    hue_stability = smoothstep(cfg.low_chroma_start, cfg.low_chroma_end, torch.minimum(base_chroma, ref_chroma))
+    delta_sanity_luma = smooth_confidence_from_range(delta_maps["luma_delta"].abs(), cfg.max_diffuse_luma_delta, cfg.delta_sanity_luma)
+    delta_sanity_hue = smooth_confidence_from_range(delta_maps["hue_delta"].abs(), cfg.max_diffuse_hue_delta, cfg.delta_sanity_hue)
+    delta_sanity_chroma = smooth_confidence_from_range(
+        (delta_maps["chroma_scale"] - 1.0).abs(),
+        max(1.0 - cfg.min_diffuse_chroma_scale, cfg.max_diffuse_chroma_scale - 1.0),
+        cfg.delta_sanity_chroma_scale,
+    )
+    luma_confidence = (density * aligned_specular_conf * aligned_shadow_conf * delta_sanity_luma).clamp(0.0, 1.0)
+    hue_confidence = (luma_confidence * hue_stability * delta_sanity_hue).clamp(0.0, 1.0)
+    chroma_confidence = (luma_confidence * hue_stability * aligned_specular_conf * delta_sanity_chroma).clamp(0.0, 1.0)
+
     dense = {
         "luma_delta": delta_maps["luma_delta"] * blend + fallback["luma_delta"] * (1.0 - blend),
         "hue_delta": delta_maps["hue_delta"] * blend + fallback["hue_delta"] * (1.0 - blend),
         "chroma_scale": delta_maps["chroma_scale"] * blend + fallback["chroma_scale"] * (1.0 - blend),
         "match_density": density,
+        "luma_confidence": luma_confidence,
+        "hue_confidence": hue_confidence,
+        "chroma_confidence": chroma_confidence,
+        "ref_residual_confidence": aligned_ref_conf,
+        "specular_confidence": aligned_specular_conf,
+        "shadow_confidence": aligned_shadow_conf,
+        "hue_stability_confidence": hue_stability,
     }
     sparse_samples = sample_delta_candidates(base_proxy, ref_proxy, confidence, matches, cfg)
     stats = {
@@ -595,6 +619,42 @@ def save_sparse_delta_visual(path: str | Path, points: Tensor, values: Tensor, h
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     img.save(path)
+
+
+def dense_sample_debug_map(points: Tensor, values: Tensor, height: int, width: int, default: float, cfg: LocalMatchingConfig) -> Tensor:
+    device = points.device if points.numel() > 0 else values.device
+    dtype = values.dtype
+    fallback = torch.full((1, 1, height, width), float(default), device=device, dtype=dtype)
+    weights = torch.ones_like(values)
+    side_scale = min(1.0, float(max(16, int(cfg.sparse_map_long_edge))) / float(max(height, width)))
+    low_h = max(8, int(round(height * side_scale)))
+    low_w = max(8, int(round(width * side_scale)))
+    low, _ = interpolate_sparse_channel(points, values, weights, low_h, low_w, fallback, cfg)
+    return resize_to_hw_unclamped(low, height, width)
+
+
+def sparse_debug_maps(samples: Dict[str, Tensor], matches: Dict[str, Any], height: int, width: int, cfg: LocalMatchingConfig) -> Dict[str, Tensor]:
+    if matches["scores"].numel() > 0:
+        match_conf = dense_sample_debug_map(matches["base_points"], matches["scores"].clamp(0.0, 1.0), height, width, 0.0, cfg).clamp(0.0, 1.0)
+    else:
+        match_conf = torch.zeros((1, 1, height, width), device=samples["base_points"].device, dtype=samples["base_points"].dtype)
+
+    if samples["base_points"].numel() > 0:
+        luma = dense_sample_debug_map(samples["base_points"], samples["luma_delta"], height, width, 0.0, cfg).clamp(
+            -float(cfg.max_diffuse_luma_delta), float(cfg.max_diffuse_luma_delta)
+        )
+        hue = dense_sample_debug_map(samples["base_points"], samples["hue_delta"], height, width, 0.0, cfg).clamp(
+            -float(cfg.max_diffuse_hue_delta), float(cfg.max_diffuse_hue_delta)
+        )
+        chroma = dense_sample_debug_map(samples["base_points"], samples["chroma_scale"], height, width, 1.0, cfg).clamp(
+            float(cfg.min_diffuse_chroma_scale), float(cfg.max_diffuse_chroma_scale)
+        )
+    else:
+        luma = torch.zeros_like(match_conf)
+        hue = torch.zeros_like(match_conf)
+        chroma = torch.ones_like(match_conf)
+
+    return {"match_confidence": match_conf, "luma_delta": luma, "hue_delta": hue, "chroma_scale": chroma}
 
 
 def confidence_maps(
@@ -735,6 +795,7 @@ def run_local_diffuse_matching(
             "score_filtered_count": 0,
             "inlier_count": 0,
             "device": str(base_intermediate_lab.device),
+            "homography": None,
         }
     timings["lightglue_match"] = time.perf_counter() - t_match
 
@@ -757,14 +818,31 @@ def run_local_diffuse_matching(
         }
         local_mode = "fallback_global"
     timings["sparse_interpolation"] = time.perf_counter() - t_interp
+    applied_confidence = dict(confidence)
+    for key in (
+        "luma_confidence",
+        "hue_confidence",
+        "chroma_confidence",
+        "ref_residual_confidence",
+        "specular_confidence",
+        "shadow_confidence",
+        "hue_stability_confidence",
+    ):
+        if key in delta_maps:
+            applied_confidence[key] = delta_maps[key]
+    applied_confidence["combined_confidence"] = torch.maximum(
+        applied_confidence["luma_confidence"],
+        torch.maximum(applied_confidence["hue_confidence"], applied_confidence["chroma_confidence"]),
+    )
+    applied_confidence["ref_residual_rejection"] = 1.0 - applied_confidence["ref_residual_confidence"]
 
     t_apply = time.perf_counter()
     final_lab, maps = apply_local_maps(
         base_intermediate_lab,
         delta_maps,
-        confidence["luma_confidence"],
-        confidence["hue_confidence"],
-        confidence["chroma_confidence"],
+        applied_confidence["luma_confidence"],
+        applied_confidence["hue_confidence"],
+        applied_confidence["chroma_confidence"],
         cfg,
     )
     maps["match_density"] = delta_maps["match_density"]
@@ -798,6 +876,7 @@ def run_local_diffuse_matching(
     )
 
     t2 = time.perf_counter()
+    sparse_debug = sparse_debug_maps(sparse_samples, matches, base_intermediate_rgb.shape[2], base_intermediate_rgb.shape[3], cfg)
     save_gray(paths["diffuse_luma_delta"], signed_map_visual(maps["luma_delta"], cfg.max_diffuse_luma_delta))
     save_gray(paths["diffuse_hue_delta"], signed_map_visual(maps["hue_delta"], cfg.max_diffuse_hue_delta))
     save_gray(
@@ -805,20 +884,20 @@ def run_local_diffuse_matching(
         range_map_visual(maps["chroma_scale"], cfg.min_diffuse_chroma_scale, cfg.max_diffuse_chroma_scale),
     )
     save_gray(paths["diffuse_confidence"], gray_visual(maps["confidence"]))
-    save_gray(paths["diffuse_residual_rejection"], gray_visual(confidence["ref_residual_rejection"]))
-    save_gray(paths["ref_residual_confidence"], gray_visual(confidence["ref_residual_confidence"]))
-    save_gray(paths["specular_confidence"], gray_visual(confidence["specular_confidence"]))
-    save_gray(paths["shadow_confidence"], gray_visual(confidence["shadow_confidence"]))
-    save_gray(paths["hue_stability_confidence"], gray_visual(confidence["hue_stability_confidence"]))
+    save_gray(paths["diffuse_residual_rejection"], gray_visual(applied_confidence["ref_residual_rejection"]))
+    save_gray(paths["ref_residual_confidence"], gray_visual(applied_confidence["ref_residual_confidence"]))
+    save_gray(paths["specular_confidence"], gray_visual(applied_confidence["specular_confidence"]))
+    save_gray(paths["shadow_confidence"], gray_visual(applied_confidence["shadow_confidence"]))
+    save_gray(paths["hue_stability_confidence"], gray_visual(applied_confidence["hue_stability_confidence"]))
     save_gray(paths["delta_sanity_confidence"], gray_visual(confidence["delta_sanity_confidence"]))
-    save_gray(paths["luma_confidence"], gray_visual(confidence["luma_confidence"]))
-    save_gray(paths["hue_confidence"], gray_visual(confidence["hue_confidence"]))
-    save_gray(paths["chroma_confidence"], gray_visual(confidence["chroma_confidence"]))
+    save_gray(paths["luma_confidence"], gray_visual(applied_confidence["luma_confidence"]))
+    save_gray(paths["hue_confidence"], gray_visual(applied_confidence["hue_confidence"]))
+    save_gray(paths["chroma_confidence"], gray_visual(applied_confidence["chroma_confidence"]))
     save_match_visual(paths["lightglue_matches"], base_intermediate_rgb, reference_resized_rgb, matches)
-    save_sparse_delta_visual(paths["filtered_match_confidence"], matches["base_points"], matches["scores"], base_intermediate_rgb.shape[2], base_intermediate_rgb.shape[3], "confidence", cfg)
-    save_sparse_delta_visual(paths["sparse_luma_delta"], sparse_samples["base_points"], sparse_samples["luma_delta"], base_intermediate_rgb.shape[2], base_intermediate_rgb.shape[3], "luma", cfg)
-    save_sparse_delta_visual(paths["sparse_hue_delta"], sparse_samples["base_points"], sparse_samples["hue_delta"], base_intermediate_rgb.shape[2], base_intermediate_rgb.shape[3], "hue", cfg)
-    save_sparse_delta_visual(paths["sparse_chroma_scale"], sparse_samples["base_points"], sparse_samples["chroma_scale"], base_intermediate_rgb.shape[2], base_intermediate_rgb.shape[3], "chroma", cfg)
+    save_gray(paths["filtered_match_confidence"], gray_visual(sparse_debug["match_confidence"]))
+    save_gray(paths["sparse_luma_delta"], signed_map_visual(sparse_debug["luma_delta"], cfg.max_diffuse_luma_delta))
+    save_gray(paths["sparse_hue_delta"], signed_map_visual(sparse_debug["hue_delta"], cfg.max_diffuse_hue_delta))
+    save_gray(paths["sparse_chroma_scale"], range_map_visual(sparse_debug["chroma_scale"], cfg.min_diffuse_chroma_scale, cfg.max_diffuse_chroma_scale))
     save_gray(paths["match_density"], gray_visual(maps["match_density"]))
     save_rgb(paths["final_output"], to_hwc_np(final_rgb))
     timings["local_debug_saves"] = time.perf_counter() - t2
@@ -832,15 +911,15 @@ def run_local_diffuse_matching(
         "global_timings": serial_global.get("timings", {}),
         "local_timings": timings,
         "mean_local_confidence": float(maps["confidence"].mean().detach().cpu()),
-        "mean_ref_residual_confidence": float(confidence["ref_residual_confidence"].mean().detach().cpu()),
-        "mean_specular_confidence": float(confidence["specular_confidence"].mean().detach().cpu()),
-        "mean_shadow_confidence": float(confidence["shadow_confidence"].mean().detach().cpu()),
-        "mean_hue_stability_confidence": float(confidence["hue_stability_confidence"].mean().detach().cpu()),
+        "mean_ref_residual_confidence": float(applied_confidence["ref_residual_confidence"].mean().detach().cpu()),
+        "mean_specular_confidence": float(applied_confidence["specular_confidence"].mean().detach().cpu()),
+        "mean_shadow_confidence": float(applied_confidence["shadow_confidence"].mean().detach().cpu()),
+        "mean_hue_stability_confidence": float(applied_confidence["hue_stability_confidence"].mean().detach().cpu()),
         "mean_delta_sanity_confidence": float(confidence["delta_sanity_confidence"].mean().detach().cpu()),
-        "mean_local_luma_confidence": float(confidence["luma_confidence"].mean().detach().cpu()),
-        "mean_local_hue_confidence": float(confidence["hue_confidence"].mean().detach().cpu()),
-        "mean_local_chroma_confidence": float(confidence["chroma_confidence"].mean().detach().cpu()),
-        "mean_local_residual_rejection": float(confidence["ref_residual_rejection"].mean().detach().cpu()),
+        "mean_local_luma_confidence": float(applied_confidence["luma_confidence"].mean().detach().cpu()),
+        "mean_local_hue_confidence": float(applied_confidence["hue_confidence"].mean().detach().cpu()),
+        "mean_local_chroma_confidence": float(applied_confidence["chroma_confidence"].mean().detach().cpu()),
+        "mean_local_residual_rejection": float(applied_confidence["ref_residual_rejection"].mean().detach().cpu()),
         "lightglue_device": matches["device"],
         "lightglue_extractor": "aliked",
         "lightglue_mode": local_mode,
