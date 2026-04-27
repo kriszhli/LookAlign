@@ -1,8 +1,6 @@
 # LookAlign V0.3.6
 
-LookAlign is for AI-assisted color editing and color grading. It takes a source image and a reference image, then pushes the source toward the reference look while trying to keep the original structure and detail intact.
-
-Use it by opening the local app, loading source/reference images, and running the current pipeline.
+LookAlign is a high-performance color matching system that transfers the visual style of an AI-generated reference onto a source image while preserving all original details and structure. It combines spatially-aware matching with deterministic color transforms to achieve accurate results even when the reference contains extreme AI artifacts. Designed for near real-time performance, LookAlign is built for modern image and video workflows where precision and speed both matter.
 
 ## Versions
 
