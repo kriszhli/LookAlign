@@ -38,9 +38,13 @@ class LocalMatchingConfig:
     min_match_score: float = 0.20
     ransac_reproj_threshold: float = 8.0
     min_valid_matches: int = 24
-    sparse_map_long_edge: int = 192
+    sparse_map_long_edge: int = 384
     fallback_global_blend: float = 0.20
-    sparse_sigma: float = 0.075
+    sparse_sigma: float = 0.035
+    sparse_density_blend_low: float = 0.005
+    sparse_density_blend_high: float = 0.060
+    map_smoothing_passes: int = 1
+    map_smoothing_strength: float = 0.35
     diffuse_proxy_long_edge: int = 320
     diffuse_blur_passes: int = 4
     max_diffuse_luma_delta: float = 0.10
@@ -406,7 +410,7 @@ def interpolate_sparse_channel(
     dense = out_num / out_den.clamp_min(1e-6)
     density = (out_den / out_den.max().clamp_min(1e-6)).clamp(0.0, 1.0)
     fallback_small = resize_to_hw_unclamped(fallback, height, width)[0, 0].reshape(-1)
-    blend = smoothstep(0.02, 0.18, density)
+    blend = smoothstep(cfg.sparse_density_blend_low, cfg.sparse_density_blend_high, density)
     dense = dense * blend + fallback_small * (1.0 - blend)
     return dense.view(1, 1, height, width), density.view(1, 1, height, width)
 
@@ -422,9 +426,10 @@ def edge_aware_lowres_smooth(maps: Dict[str, Tensor], base_proxy: Tensor, cfg: L
     out = {}
     for key in ("luma_delta", "hue_delta", "chroma_scale"):
         blurred = maps[key]
-        for _ in range(2):
-            blurred = F.avg_pool2d(F.pad(blurred, (2, 2, 2, 2), mode="replicate"), kernel_size=5, stride=1)
-        out[key] = maps[key] * (1.0 - smooth_mix) + blurred * smooth_mix
+        for _ in range(max(0, int(cfg.map_smoothing_passes))):
+            blurred = F.avg_pool2d(F.pad(blurred, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+        local_mix = smooth_mix * float(np.clip(cfg.map_smoothing_strength, 0.0, 1.0))
+        out[key] = maps[key] * (1.0 - local_mix) + blurred * local_mix
     out["match_density"] = maps["match_density"]
     return out
 
@@ -461,7 +466,7 @@ def lightglue_delta_maps(
         "chroma_scale": resize_to_hw_unclamped(low_maps["chroma_scale"], height, width).clamp(float(cfg.min_diffuse_chroma_scale), float(cfg.max_diffuse_chroma_scale)),
         "match_density": resize_to_hw_unclamped(low_maps["match_density"], height, width).clamp(0.0, 1.0),
     }
-    fallback_ratio = float((dense["match_density"] < 0.18).float().mean().detach().cpu())
+    fallback_ratio = float((dense["match_density"] < float(cfg.sparse_density_blend_high)).float().mean().detach().cpu())
     stats = {
         "sparse_sample_count": int(samples["base_points"].shape[0]),
         "match_density_mean": float(dense["match_density"].mean().detach().cpu()),
