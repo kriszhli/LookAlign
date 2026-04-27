@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Gradio UI for LookAlign V0.3.5."""
+"""Local Gradio UI for LookAlign V0.3.6."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from typing import Optional, Tuple
 
 import gradio as gr
 
+from scripts.global_matching import GlobalMatchingConfig, run_global_matching
 from scripts.local_matching import LocalMatchingConfig, run_local_diffuse_matching
-from scripts.ot_svd_lut_mps import OTSVDLUTConfig, run_ot_svd_lut_mps
 
 
 ROOT = Path(__file__).resolve().parent
@@ -36,9 +36,9 @@ def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[s
     reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
     run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
-    # V0.3.5 uses locked global and local matching parameters.
+    # V0.3.6 uses locked global and local matching parameters.
     # The UI intentionally exposes no tuning sliders while the stages stabilize.
-    global_metrics = run_ot_svd_lut_mps(source, reference, run_dir, OTSVDLUTConfig())
+    global_metrics = run_global_matching(source, reference, run_dir, GlobalMatchingConfig())
     tensors = global_metrics["tensors"]
     metrics = run_local_diffuse_matching(
         base_intermediate_lab=tensors["base_intermediate_lab"],
@@ -77,14 +77,14 @@ def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[s
 
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="LookAlign V0.3.5") as demo:
-        gr.Markdown("# LookAlign V0.3.5")
+    with gr.Blocks(title="LookAlign V0.3.6") as demo:
+        gr.Markdown("# LookAlign V0.3.6")
 
         with gr.Row():
             source_image = gr.Image(label="Source image", type="filepath", value=existing_path(DEFAULT_SOURCE), interactive=True)
             reference_image = gr.Image(label="Reference image", type="filepath", value=existing_path(DEFAULT_REFERENCE), interactive=True)
 
-        run_button = gr.Button("Run V0.3.5", variant="primary")
+        run_button = gr.Button("Run V0.3.6", variant="primary")
 
         final_output = gr.Image(label="Final output", type="filepath")
 
@@ -109,11 +109,11 @@ def build_app() -> gr.Blocks:
             chroma_confidence = gr.Image(label="Chroma confidence", type="filepath")
         with gr.Row():
             lightglue_matches = gr.Image(label="LightGlue matches", type="filepath")
-            filtered_match_confidence = gr.Image(label="Filtered match confidence", type="filepath")
+            filtered_match_confidence = gr.Image(label="Aligned match confidence", type="filepath")
         with gr.Row():
-            sparse_luma_delta = gr.Image(label="Sparse luma delta samples", type="filepath")
-            sparse_hue_delta = gr.Image(label="Sparse hue delta samples", type="filepath")
-            sparse_chroma_scale = gr.Image(label="Sparse chroma scale samples", type="filepath")
+            sparse_luma_delta = gr.Image(label="Luma delta diagnostic", type="filepath")
+            sparse_hue_delta = gr.Image(label="Hue delta diagnostic", type="filepath")
+            sparse_chroma_scale = gr.Image(label="Chroma scale diagnostic", type="filepath")
         with gr.Row():
             match_density = gr.Image(label="Match density", type="filepath")
 

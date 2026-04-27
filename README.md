@@ -1,7 +1,8 @@
-# LookAlign V0.3.5
+# LookAlign V0.3.6
 
 ## Versions
 
+- `V0.3.6`: replaces the old OT/SVD global stage with a simple linear-RGB 3D LUT fit, then runs LightGlue+ALIKED first in local matching, warps the reference into base coordinates, and applies dense aligned OKLab diffuse luma/hue/chroma corrections with residual/specular confidence.
 - `V0.3.5`: uses global OT/SVD for the OKLab `base_intermediate`, then LightGlue+ALIKED correspondences guide sparse diffuse-shading luma/hue/chroma samples from the reference into smooth MPS local correction maps with residual/specular confidence, match-density fallback, and debug views.
 - `V0.3.1`: replaces the rejected V0.3 global-LUT/BGrid prototype with an MPS-required sliced partial OT color transport stage distilled into an SVD-smoothed LUT. The output is a conservative base intermediate for a future CNN local affine field.
 - `V0.3.0`: a complete remake of LookAlign. The pipeline now uses ML models to learn the appearance transform directly from source/reference pairs instead of relying on manual calculations or SA-LUT-style lookup fitting. This release shifts the core workflow from hand-designed correction logic to a learned global LUT fitting approach, with the UI and metrics updated to match the new model-driven pipeline.

@@ -1,4 +1,4 @@
-"""LookAlign V0.3.5 local diffuse mood matching.
+"""LookAlign V0.3.6 local diffuse mood matching.
 
 This stage is intentionally deterministic and lightweight. It approximates a
 colorful diffuse-shading transfer by operating on smooth OKLab maps while
@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
-from scripts.ot_svd_lut_mps import (
+from scripts.global_matching import (
     Tensor,
     image_stats_from_lab,
     oklab_to_rgb,
@@ -27,6 +27,20 @@ from scripts.ot_svd_lut_mps import (
     save_rgb,
     soft_gamut_compress,
     to_hwc_np,
+)
+
+
+ALIGNMENT_KEYS = (
+    "ref_residual_confidence",
+    "specular_confidence",
+    "shadow_confidence",
+    "hue_stability_confidence",
+    "delta_sanity_confidence",
+    "luma_confidence",
+    "hue_confidence",
+    "chroma_confidence",
+    "combined_confidence",
+    "ref_residual_rejection",
 )
 
 
@@ -171,7 +185,7 @@ def get_lightglue_models(device_name: str, max_keypoints: int) -> tuple[Any, Any
         from lightglue.utils import rbd
     except ImportError as exc:
         raise RuntimeError(
-            "LightGlue is required for V0.3.5 correspondence-guided local matching. "
+            "LightGlue is required for V0.3.6 correspondence-guided local matching. "
             "Install it with `python3 -m pip install git+https://github.com/cvg/LightGlue.git`, "
             "or run with LocalMatchingConfig(enable_lightglue=False) for the conservative fallback."
         ) from exc
@@ -342,105 +356,6 @@ def global_fallback_maps(base_proxy: Tensor, ref_proxy: Tensor, confidence: Dict
     }
 
 
-def sample_delta_candidates(
-    base_proxy: Tensor,
-    ref_proxy: Tensor,
-    confidence: Dict[str, Tensor],
-    matches: Dict[str, Any],
-    cfg: LocalMatchingConfig,
-) -> Dict[str, Tensor]:
-    base_points = matches["base_points"]
-    ref_points = matches["ref_points"]
-    if base_points.numel() == 0:
-        empty = torch.empty((0,), device=base_proxy.device, dtype=base_proxy.dtype)
-        return {"base_points": base_points, "luma_delta": empty, "hue_delta": empty, "chroma_scale": empty, "luma_weight": empty, "hue_weight": empty, "chroma_weight": empty}
-
-    base_samples = sample_points(base_proxy, base_points)
-    ref_samples = sample_points(ref_proxy, ref_points)
-    base_chroma = base_samples[:, 1:3].norm(dim=1).clamp_min(1e-6)
-    ref_chroma = ref_samples[:, 1:3].norm(dim=1).clamp_min(1e-6)
-    base_hue = torch.atan2(base_samples[:, 2], base_samples[:, 1])
-    ref_hue = torch.atan2(ref_samples[:, 2], ref_samples[:, 1])
-
-    raw_luma = ref_samples[:, 0] - base_samples[:, 0]
-    raw_hue = torch.atan2(torch.sin(ref_hue - base_hue), torch.cos(ref_hue - base_hue))
-    raw_chroma = ref_chroma / base_chroma
-
-    luma_delta = raw_luma.clamp(-float(cfg.max_diffuse_luma_delta), float(cfg.max_diffuse_luma_delta))
-    hue_delta = raw_hue.clamp(-float(cfg.max_diffuse_hue_delta), float(cfg.max_diffuse_hue_delta))
-    chroma_scale = raw_chroma.clamp(float(cfg.min_diffuse_chroma_scale), float(cfg.max_diffuse_chroma_scale))
-
-    ref_residual = sample_points(confidence["ref_residual_confidence"], ref_points)[:, 0]
-    specular = sample_points(confidence["specular_confidence"], ref_points)[:, 0]
-    shadow = sample_points(confidence["shadow_confidence"], ref_points)[:, 0]
-    hue_stability = smoothstep(cfg.low_chroma_start, cfg.low_chroma_end, torch.minimum(base_chroma, ref_chroma))
-    delta_luma = smooth_confidence_from_range(raw_luma.abs(), cfg.max_diffuse_luma_delta, cfg.delta_sanity_luma)
-    delta_hue = smooth_confidence_from_range(raw_hue.abs(), cfg.max_diffuse_hue_delta, cfg.delta_sanity_hue)
-    delta_chroma = smooth_confidence_from_range(
-        (raw_chroma - 1.0).abs(),
-        max(1.0 - cfg.min_diffuse_chroma_scale, cfg.max_diffuse_chroma_scale - 1.0),
-        cfg.delta_sanity_chroma_scale,
-    )
-    match_scores = matches["scores"].clamp(0.0, 1.0)
-
-    luma_weight = match_scores * ref_residual * specular * shadow * delta_luma
-    hue_weight = luma_weight * hue_stability * delta_hue
-    chroma_weight = luma_weight * hue_stability * specular * delta_chroma
-    keep = (luma_weight > 0.03) | (hue_weight > 0.03) | (chroma_weight > 0.03)
-    return {
-        "base_points": base_points[keep],
-        "luma_delta": luma_delta[keep],
-        "hue_delta": hue_delta[keep],
-        "chroma_scale": chroma_scale[keep],
-        "luma_weight": luma_weight[keep],
-        "hue_weight": hue_weight[keep],
-        "chroma_weight": chroma_weight[keep],
-    }
-
-
-def interpolate_sparse_channel(
-    points_xy: Tensor,
-    values: Tensor,
-    weights: Tensor,
-    height: int,
-    width: int,
-    fallback: Tensor,
-    cfg: LocalMatchingConfig,
-) -> tuple[Tensor, Tensor]:
-    if points_xy.shape[0] == 0:
-        return fallback.expand(1, 1, height, width).clone(), torch.zeros((1, 1, height, width), device=fallback.device, dtype=fallback.dtype)
-    yy, xx = torch.meshgrid(
-        torch.linspace(0.0, 1.0, height, device=points_xy.device, dtype=points_xy.dtype),
-        torch.linspace(0.0, 1.0, width, device=points_xy.device, dtype=points_xy.dtype),
-        indexing="ij",
-    )
-    grid = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
-    _, _, full_h, full_w = fallback.shape
-    norm_points = torch.stack(
-        (
-            points_xy[:, 0] / max(full_w - 1, 1),
-            points_xy[:, 1] / max(full_h - 1, 1),
-        ),
-        dim=1,
-    )
-    out_num = torch.zeros((grid.shape[0],), device=points_xy.device, dtype=points_xy.dtype)
-    out_den = torch.zeros_like(out_num)
-    sigma2 = max(float(cfg.sparse_sigma), 1e-4) ** 2
-    for start in range(0, int(grid.shape[0]), 4096):
-        chunk = grid[start : start + 4096]
-        dist2 = ((chunk[:, None, :] - norm_points[None, :, :]) ** 2).sum(dim=2)
-        w = torch.exp(-dist2 / (2.0 * sigma2)) * weights.unsqueeze(0)
-        den = w.sum(dim=1)
-        out_num[start : start + chunk.shape[0]] = (w * values.unsqueeze(0)).sum(dim=1)
-        out_den[start : start + chunk.shape[0]] = den
-    dense = out_num / out_den.clamp_min(1e-6)
-    density = (out_den / out_den.max().clamp_min(1e-6)).clamp(0.0, 1.0)
-    fallback_small = resize_to_hw_unclamped(fallback, height, width)[0, 0].reshape(-1)
-    blend = smoothstep(cfg.sparse_density_blend_low, cfg.sparse_density_blend_high, density)
-    dense = dense * blend + fallback_small * (1.0 - blend)
-    return dense.view(1, 1, height, width), density.view(1, 1, height, width)
-
-
 def edge_aware_lowres_smooth(maps: Dict[str, Tensor], base_proxy: Tensor, cfg: LocalMatchingConfig) -> Dict[str, Tensor]:
     base_l = resize_to_hw_unclamped(base_proxy[:, 0:1], maps["luma_delta"].shape[2], maps["luma_delta"].shape[3])
     grad_x = F.pad((base_l[:, :, :, 1:] - base_l[:, :, :, :-1]).abs(), (0, 1, 0, 0), mode="replicate")
@@ -460,110 +375,114 @@ def edge_aware_lowres_smooth(maps: Dict[str, Tensor], base_proxy: Tensor, cfg: L
     return out
 
 
-def lightglue_delta_maps(
-    base_proxy: Tensor,
-    ref_proxy: Tensor,
-    confidence: Dict[str, Tensor],
-    matches: Dict[str, Any],
-    cfg: LocalMatchingConfig,
-) -> tuple[Dict[str, Tensor], Dict[str, Any], Dict[str, Tensor]]:
-    _, _, height, width = base_proxy.shape
-    fallback = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
-    samples = sample_delta_candidates(base_proxy, ref_proxy, confidence, matches, cfg)
-    side_scale = min(1.0, float(max(16, int(cfg.sparse_map_long_edge))) / float(max(height, width)))
-    low_h = max(8, int(round(height * side_scale)))
-    low_w = max(8, int(round(width * side_scale)))
+def estimate_alignment(base_rgb: Tensor, reference_rgb: Tensor, cfg: LocalMatchingConfig) -> Dict[str, Any]:
+    if not cfg.enable_lightglue:
+        empty_points = torch.empty((0, 2), device=base_rgb.device, dtype=base_rgb.dtype)
+        return {
+            "base_points": empty_points,
+            "ref_points": empty_points,
+            "scores": torch.empty((0,), device=base_rgb.device, dtype=base_rgb.dtype),
+            "raw_count": 0,
+            "score_filtered_count": 0,
+            "inlier_count": 0,
+            "device": str(base_rgb.device),
+            "homography": None,
+            "valid": False,
+        }
+    matches = run_lightglue_matches(base_rgb, reference_rgb, cfg)
+    matches["valid"] = matches.get("homography") is not None and int(matches["inlier_count"]) >= int(cfg.min_valid_matches)
+    return matches
 
-    fallback_luma = fallback["luma_delta"]
-    fallback_hue = fallback["hue_delta"]
-    fallback_chroma = fallback["chroma_scale"]
-    luma_low, density_l = interpolate_sparse_channel(samples["base_points"], samples["luma_delta"], samples["luma_weight"], low_h, low_w, fallback_luma, cfg)
-    hue_low, density_h = interpolate_sparse_channel(samples["base_points"], samples["hue_delta"], samples["hue_weight"], low_h, low_w, fallback_hue, cfg)
-    chroma_low, density_c = interpolate_sparse_channel(samples["base_points"], samples["chroma_scale"], samples["chroma_weight"], low_h, low_w, fallback_chroma, cfg)
-    density = torch.maximum(density_l, torch.maximum(density_h, density_c))
-    low_maps = edge_aware_lowres_smooth(
-        {"luma_delta": luma_low, "hue_delta": hue_low, "chroma_scale": chroma_low, "match_density": density},
-        base_proxy,
+
+def build_aligned_reference_fields(
+    base_lab: Tensor,
+    reference_lab: Tensor,
+    reference_rgb: Tensor,
+    alignment: Dict[str, Any],
+    cfg: LocalMatchingConfig,
+) -> Dict[str, Any]:
+    base_proxy = low_frequency_proxy_oklab(base_lab, cfg)
+    if not alignment["valid"]:
+        ref_lab = reference_lab
+        ref_rgb = reference_rgb
+        valid = torch.ones_like(base_lab[:, 0:1])
+        mode = "fallback_global"
+    else:
+        ref_lab, valid = warp_reference_to_base(reference_lab, alignment["homography"], base_lab.shape[2], base_lab.shape[3])
+        ref_rgb, _ = warp_reference_to_base(reference_rgb, alignment["homography"], base_lab.shape[2], base_lab.shape[3])
+        mode = "lightglue_aligned_proxy"
+    ref_proxy = low_frequency_proxy_oklab(ref_lab, cfg)
+    confidence = confidence_maps(base_lab, base_proxy, ref_lab, ref_proxy, oklab_to_rgb(base_lab), ref_rgb, cfg)
+    confidence["combined_confidence"] = (confidence["combined_confidence"] * valid).clamp(0.0, 1.0)
+    confidence["ref_residual_rejection"] = 1.0 - (confidence["ref_residual_confidence"] * valid).clamp(0.0, 1.0)
+    for key in ALIGNMENT_KEYS:
+        if key in confidence:
+            confidence[key] = (confidence[key] * valid).clamp(0.0, 1.0)
+    return {
+        "base_proxy": base_proxy,
+        "reference_lab": ref_lab,
+        "reference_rgb": ref_rgb,
+        "reference_proxy": ref_proxy,
+        "warp_validity": valid,
+        "confidence": confidence,
+        "mode": mode,
+    }
+
+
+def compute_dense_deltas_and_apply(
+    base_lab: Tensor,
+    aligned_fields: Dict[str, Any],
+    reference_lab_unaligned: Tensor,
+    base_rgb: Tensor,
+    alignment: Dict[str, Any],
+    cfg: LocalMatchingConfig,
+) -> tuple[Tensor, Dict[str, Tensor], Dict[str, Any], Dict[str, Tensor]]:
+    base_proxy = aligned_fields["base_proxy"]
+    ref_proxy = aligned_fields["reference_proxy"]
+    confidence = aligned_fields["confidence"]
+    valid = aligned_fields["warp_validity"]
+    fallback = global_fallback_maps(base_proxy, reference_lab_unaligned if reference_lab_unaligned.shape == ref_proxy.shape else ref_proxy, confidence, cfg)
+    dense = proxy_delta_maps(base_proxy, ref_proxy, cfg)
+    dense["match_density"] = (valid * confidence["ref_residual_confidence"]).clamp(0.0, 1.0)
+    low_maps = edge_aware_lowres_smooth(dense, base_proxy, cfg)
+    dense["luma_delta"] = resize_to_hw_unclamped(low_maps["luma_delta"], base_lab.shape[2], base_lab.shape[3]).clamp(
+        -float(cfg.max_diffuse_luma_delta), float(cfg.max_diffuse_luma_delta)
+    )
+    dense["hue_delta"] = resize_to_hw_unclamped(low_maps["hue_delta"], base_lab.shape[2], base_lab.shape[3]).clamp(
+        -float(cfg.max_diffuse_hue_delta), float(cfg.max_diffuse_hue_delta)
+    )
+    dense["chroma_scale"] = resize_to_hw_unclamped(low_maps["chroma_scale"], base_lab.shape[2], base_lab.shape[3]).clamp(
+        float(cfg.min_diffuse_chroma_scale), float(cfg.max_diffuse_chroma_scale)
+    )
+    dense["match_density"] = resize_to_hw_unclamped(low_maps["match_density"], base_lab.shape[2], base_lab.shape[3]).clamp(0.0, 1.0)
+    blend = smoothstep(cfg.sparse_density_blend_low, cfg.sparse_density_blend_high, dense["match_density"])
+    dense["luma_delta"] = dense["luma_delta"] * blend + fallback["luma_delta"] * (1.0 - blend)
+    dense["hue_delta"] = dense["hue_delta"] * blend + fallback["hue_delta"] * (1.0 - blend)
+    dense["chroma_scale"] = dense["chroma_scale"] * blend + fallback["chroma_scale"] * (1.0 - blend)
+
+    final_lab, maps = apply_local_maps(
+        base_lab,
+        dense,
+        confidence["luma_confidence"],
+        confidence["hue_confidence"],
+        confidence["chroma_confidence"],
         cfg,
     )
-    dense = {
-        "luma_delta": resize_to_hw_unclamped(low_maps["luma_delta"], height, width).clamp(-float(cfg.max_diffuse_luma_delta), float(cfg.max_diffuse_luma_delta)),
-        "hue_delta": resize_to_hw_unclamped(low_maps["hue_delta"], height, width).clamp(-float(cfg.max_diffuse_hue_delta), float(cfg.max_diffuse_hue_delta)),
-        "chroma_scale": resize_to_hw_unclamped(low_maps["chroma_scale"], height, width).clamp(float(cfg.min_diffuse_chroma_scale), float(cfg.max_diffuse_chroma_scale)),
-        "match_density": resize_to_hw_unclamped(low_maps["match_density"], height, width).clamp(0.0, 1.0),
-    }
-    fallback_ratio = float((dense["match_density"] < float(cfg.sparse_density_blend_high)).float().mean().detach().cpu())
+    maps["match_density"] = dense["match_density"]
+    maps["filtered_match_confidence"] = confidence["combined_confidence"]
     stats = {
-        "sparse_sample_count": int(samples["base_points"].shape[0]),
+        "sparse_sample_count": int(alignment["base_points"].shape[0]),
         "match_density_mean": float(dense["match_density"].mean().detach().cpu()),
-        "fallback_ratio": fallback_ratio,
+        "fallback_ratio": float((dense["match_density"] < float(cfg.sparse_density_blend_high)).float().mean().detach().cpu()),
     }
-    return dense, stats, samples
 
-
-def aligned_proxy_delta_maps(
-    base_proxy: Tensor,
-    ref_proxy: Tensor,
-    confidence: Dict[str, Tensor],
-    matches: Dict[str, Any],
-    cfg: LocalMatchingConfig,
-) -> tuple[Dict[str, Tensor], Dict[str, Any], Dict[str, Tensor]]:
-    _, _, height, width = base_proxy.shape
-    if matches.get("homography") is None or int(matches["inlier_count"]) < int(cfg.min_valid_matches):
-        fallback = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
-        empty = torch.empty((0,), device=base_proxy.device, dtype=base_proxy.dtype)
-        samples = {
-            "base_points": torch.empty((0, 2), device=base_proxy.device, dtype=base_proxy.dtype),
-            "luma_delta": empty,
-            "hue_delta": empty,
-            "chroma_scale": empty,
-        }
-        stats = {"sparse_sample_count": 0, "match_density_mean": 0.0, "fallback_ratio": 1.0}
-        return fallback, stats, samples
-
-    aligned_ref_proxy, warp_valid = warp_reference_to_base(ref_proxy, matches["homography"], height, width)
-    delta_maps = proxy_delta_maps(base_proxy, aligned_ref_proxy, cfg)
-    aligned_ref_conf, _ = warp_reference_to_base(confidence["ref_residual_confidence"], matches["homography"], height, width)
-    aligned_specular_conf, _ = warp_reference_to_base(confidence["specular_confidence"], matches["homography"], height, width)
-    aligned_shadow_conf, _ = warp_reference_to_base(confidence["shadow_confidence"], matches["homography"], height, width)
-    density = (warp_valid * aligned_ref_conf).clamp(0.0, 1.0)
-    fallback = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
-    blend = smoothstep(cfg.sparse_density_blend_low, cfg.sparse_density_blend_high, density)
-
-    base_chroma, base_hue = chroma_and_hue(base_proxy)
-    ref_chroma, ref_hue = chroma_and_hue(aligned_ref_proxy)
-    hue_stability = smoothstep(cfg.low_chroma_start, cfg.low_chroma_end, torch.minimum(base_chroma, ref_chroma))
-    delta_sanity_luma = smooth_confidence_from_range(delta_maps["luma_delta"].abs(), cfg.max_diffuse_luma_delta, cfg.delta_sanity_luma)
-    delta_sanity_hue = smooth_confidence_from_range(delta_maps["hue_delta"].abs(), cfg.max_diffuse_hue_delta, cfg.delta_sanity_hue)
-    delta_sanity_chroma = smooth_confidence_from_range(
-        (delta_maps["chroma_scale"] - 1.0).abs(),
-        max(1.0 - cfg.min_diffuse_chroma_scale, cfg.max_diffuse_chroma_scale - 1.0),
-        cfg.delta_sanity_chroma_scale,
-    )
-    luma_confidence = (density * aligned_specular_conf * aligned_shadow_conf * delta_sanity_luma).clamp(0.0, 1.0)
-    hue_confidence = (luma_confidence * hue_stability * delta_sanity_hue).clamp(0.0, 1.0)
-    chroma_confidence = (luma_confidence * hue_stability * aligned_specular_conf * delta_sanity_chroma).clamp(0.0, 1.0)
-
-    dense = {
-        "luma_delta": delta_maps["luma_delta"] * blend + fallback["luma_delta"] * (1.0 - blend),
-        "hue_delta": delta_maps["hue_delta"] * blend + fallback["hue_delta"] * (1.0 - blend),
-        "chroma_scale": delta_maps["chroma_scale"] * blend + fallback["chroma_scale"] * (1.0 - blend),
-        "match_density": density,
-        "luma_confidence": luma_confidence,
-        "hue_confidence": hue_confidence,
-        "chroma_confidence": chroma_confidence,
-        "ref_residual_confidence": aligned_ref_conf,
-        "specular_confidence": aligned_specular_conf,
-        "shadow_confidence": aligned_shadow_conf,
-        "hue_stability_confidence": hue_stability,
+    sparse_debug = {
+        "match_confidence": confidence["combined_confidence"],
+        "luma_delta": dense["luma_delta"],
+        "hue_delta": dense["hue_delta"],
+        "chroma_scale": dense["chroma_scale"],
     }
-    sparse_samples = sample_delta_candidates(base_proxy, ref_proxy, confidence, matches, cfg)
-    stats = {
-        "sparse_sample_count": int(sparse_samples["base_points"].shape[0]),
-        "match_density_mean": float(density.mean().detach().cpu()),
-        "fallback_ratio": float((density < float(cfg.sparse_density_blend_high)).float().mean().detach().cpu()),
-    }
-    return dense, stats, sparse_samples
+    return final_lab, maps, stats, sparse_debug
 
 
 def tensor_rgb_to_uint8(img: Tensor) -> np.ndarray:
@@ -770,82 +689,36 @@ def run_local_diffuse_matching(
     timings["diffuse_proxy"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    confidence = confidence_maps(
-        base_intermediate_lab,
-        base_proxy,
-        reference_resized_lab,
-        ref_proxy,
-        base_intermediate_rgb,
-        reference_resized_rgb,
-        cfg,
+    global_confidence = confidence_maps(
+        base_intermediate_lab, base_proxy, reference_resized_lab, ref_proxy, base_intermediate_rgb, reference_resized_rgb, cfg
     )
     timings["confidence_maps"] = time.perf_counter() - t1
 
     t_match = time.perf_counter()
-    match_stats: Dict[str, Any]
-    if cfg.enable_lightglue:
-        matches = run_lightglue_matches(base_intermediate_rgb, reference_resized_rgb, cfg)
-    else:
-        empty_points = torch.empty((0, 2), device=base_intermediate_lab.device, dtype=base_intermediate_lab.dtype)
-        matches = {
-            "base_points": empty_points,
-            "ref_points": empty_points,
-            "scores": torch.empty((0,), device=base_intermediate_lab.device, dtype=base_intermediate_lab.dtype),
-            "raw_count": 0,
-            "score_filtered_count": 0,
-            "inlier_count": 0,
-            "device": str(base_intermediate_lab.device),
-            "homography": None,
-        }
+    matches = estimate_alignment(base_intermediate_rgb, reference_resized_rgb, cfg)
     timings["lightglue_match"] = time.perf_counter() - t_match
 
-    t_interp = time.perf_counter()
-    if int(matches["inlier_count"]) >= int(cfg.min_valid_matches):
-        delta_maps, sparse_stats, sparse_samples = aligned_proxy_delta_maps(base_proxy, ref_proxy, confidence, matches, cfg)
-        local_mode = "lightglue_aligned_proxy"
-    else:
-        delta_maps = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
-        sparse_samples = {
-            "base_points": torch.empty((0, 2), device=base_intermediate_lab.device, dtype=base_intermediate_lab.dtype),
-            "luma_delta": torch.empty((0,), device=base_intermediate_lab.device, dtype=base_intermediate_lab.dtype),
-            "hue_delta": torch.empty((0,), device=base_intermediate_lab.device, dtype=base_intermediate_lab.dtype),
-            "chroma_scale": torch.empty((0,), device=base_intermediate_lab.device, dtype=base_intermediate_lab.dtype),
-        }
-        sparse_stats = {
-            "sparse_sample_count": 0,
-            "match_density_mean": 0.0,
-            "fallback_ratio": 1.0,
-        }
-        local_mode = "fallback_global"
-    timings["sparse_interpolation"] = time.perf_counter() - t_interp
-    applied_confidence = dict(confidence)
-    for key in (
-        "luma_confidence",
-        "hue_confidence",
-        "chroma_confidence",
-        "ref_residual_confidence",
-        "specular_confidence",
-        "shadow_confidence",
-        "hue_stability_confidence",
-    ):
-        if key in delta_maps:
-            applied_confidence[key] = delta_maps[key]
-    applied_confidence["combined_confidence"] = torch.maximum(
-        applied_confidence["luma_confidence"],
-        torch.maximum(applied_confidence["hue_confidence"], applied_confidence["chroma_confidence"]),
-    )
-    applied_confidence["ref_residual_rejection"] = 1.0 - applied_confidence["ref_residual_confidence"]
-
-    t_apply = time.perf_counter()
-    final_lab, maps = apply_local_maps(
+    t_align = time.perf_counter()
+    aligned_fields = build_aligned_reference_fields(
         base_intermediate_lab,
-        delta_maps,
-        applied_confidence["luma_confidence"],
-        applied_confidence["hue_confidence"],
-        applied_confidence["chroma_confidence"],
+        reference_resized_lab,
+        reference_resized_rgb,
+        matches,
         cfg,
     )
-    maps["match_density"] = delta_maps["match_density"]
+    timings["aligned_reference_fields"] = time.perf_counter() - t_align
+
+    t_apply = time.perf_counter()
+    final_lab, maps, sparse_stats, sparse_debug = compute_dense_deltas_and_apply(
+        base_intermediate_lab,
+        aligned_fields,
+        ref_proxy,
+        base_intermediate_rgb,
+        matches,
+        cfg,
+    )
+    applied_confidence = aligned_fields["confidence"]
+    local_mode = aligned_fields["mode"]
     final_rgb = soft_gamut_compress(oklab_to_rgb(final_lab))
     timings["local_apply"] = time.perf_counter() - t_apply
 
@@ -876,7 +749,6 @@ def run_local_diffuse_matching(
     )
 
     t2 = time.perf_counter()
-    sparse_debug = sparse_debug_maps(sparse_samples, matches, base_intermediate_rgb.shape[2], base_intermediate_rgb.shape[3], cfg)
     save_gray(paths["diffuse_luma_delta"], signed_map_visual(maps["luma_delta"], cfg.max_diffuse_luma_delta))
     save_gray(paths["diffuse_hue_delta"], signed_map_visual(maps["hue_delta"], cfg.max_diffuse_hue_delta))
     save_gray(
@@ -889,7 +761,7 @@ def run_local_diffuse_matching(
     save_gray(paths["specular_confidence"], gray_visual(applied_confidence["specular_confidence"]))
     save_gray(paths["shadow_confidence"], gray_visual(applied_confidence["shadow_confidence"]))
     save_gray(paths["hue_stability_confidence"], gray_visual(applied_confidence["hue_stability_confidence"]))
-    save_gray(paths["delta_sanity_confidence"], gray_visual(confidence["delta_sanity_confidence"]))
+    save_gray(paths["delta_sanity_confidence"], gray_visual(applied_confidence["delta_sanity_confidence"]))
     save_gray(paths["luma_confidence"], gray_visual(applied_confidence["luma_confidence"]))
     save_gray(paths["hue_confidence"], gray_visual(applied_confidence["hue_confidence"]))
     save_gray(paths["chroma_confidence"], gray_visual(applied_confidence["chroma_confidence"]))
@@ -905,7 +777,7 @@ def run_local_diffuse_matching(
     serial_global = {key: value for key, value in global_metrics.items() if key != "tensors"}
     metrics: Dict[str, Any] = {
         **serial_global,
-        "pipeline_version": "v0.3.5-mps-global-ot-local-diffuse",
+        "pipeline_version": "v0.3.6-linear-lut-lightglue-local-diffuse",
         "global_config": serial_global.get("config", {}),
         "local_config": asdict(cfg),
         "global_timings": serial_global.get("timings", {}),
@@ -915,7 +787,7 @@ def run_local_diffuse_matching(
         "mean_specular_confidence": float(applied_confidence["specular_confidence"].mean().detach().cpu()),
         "mean_shadow_confidence": float(applied_confidence["shadow_confidence"].mean().detach().cpu()),
         "mean_hue_stability_confidence": float(applied_confidence["hue_stability_confidence"].mean().detach().cpu()),
-        "mean_delta_sanity_confidence": float(confidence["delta_sanity_confidence"].mean().detach().cpu()),
+        "mean_delta_sanity_confidence": float(applied_confidence["delta_sanity_confidence"].mean().detach().cpu()),
         "mean_local_luma_confidence": float(applied_confidence["luma_confidence"].mean().detach().cpu()),
         "mean_local_hue_confidence": float(applied_confidence["hue_confidence"].mean().detach().cpu()),
         "mean_local_chroma_confidence": float(applied_confidence["chroma_confidence"].mean().detach().cpu()),
