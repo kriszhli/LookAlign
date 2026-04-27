@@ -1,4 +1,4 @@
-"""LookAlign V0.3.6 global matching: simple linear-RGB 3D LUT fitting."""
+"""LookAlign V0.3.6 global matching: Lab-marginal 3D LUT."""
 
 from __future__ import annotations
 
@@ -6,28 +6,26 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import colour
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from colour import LUT3D
+from colour.models import RGB_COLOURSPACES, RGB_to_XYZ, XYZ_to_Lab, XYZ_to_RGB
 
 
 Tensor = torch.Tensor
-GLOBAL_STAGE_VERSION = "v0.3.6-global-linear-lut"
-PIPELINE_VERSION = "v0.3.6-linear-lut-lightglue-local-diffuse"
+GLOBAL_STAGE_VERSION = "v0.3.6-global-lab-lut"
+PIPELINE_VERSION = "v0.3.6-lab-lut-lightglue-local-diffuse"
 
 
 @dataclass
 class GlobalMatchingConfig:
     fit_long_edge: int = 768
     lut_size: int = 33
-    weak_cell_mix: float = 0.65
-    neutral_protection: float = 0.15
-    max_rgb_delta: float = 0.45
-    apply_chunk_pixels: int = 262144
 
 
 def require_mps() -> torch.device:
@@ -46,7 +44,7 @@ def require_colour() -> None:
 
 
 def load_rgb(path: str | Path) -> np.ndarray:
-    return np.asarray(Image.open(path).convert("RGB")).astype(np.float32) / 255.0
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
 
 
 def save_rgb(path: str | Path, img: np.ndarray) -> None:
@@ -95,126 +93,84 @@ def linear_to_srgb(rgb: Tensor) -> Tensor:
 
 def rgb_to_oklab(rgb: Tensor) -> Tensor:
     linear = srgb_to_linear(rgb)
-    flat = linear.permute(0, 2, 3, 1).reshape(-1, 3).detach().cpu().numpy()
-    xyz = colour.RGB_to_XYZ(
-        flat,
-        colour.models.RGB_COLOURSPACE_sRGB,
-        apply_cctf_decoding=False,
+    r, g, b = linear.unbind(dim=1)
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l_, m_, s_ = torch.sign(l) * torch.abs(l).pow(1.0 / 3.0), torch.sign(m) * torch.abs(m).pow(1.0 / 3.0), torch.sign(s) * torch.abs(s).pow(1.0 / 3.0)
+    return torch.stack(
+        (
+            0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+        ),
+        dim=1,
     )
-    lab = colour.XYZ_to_Oklab(xyz).astype(np.float32)
-    return torch.from_numpy(lab).to(device=rgb.device, dtype=rgb.dtype).reshape(rgb.shape[0], rgb.shape[2], rgb.shape[3], 3).permute(0, 3, 1, 2)
 
 
 def oklab_to_rgb(lab: Tensor) -> Tensor:
-    flat = lab.permute(0, 2, 3, 1).reshape(-1, 3).detach().cpu().numpy()
-    xyz = colour.Oklab_to_XYZ(flat)
-    linear = colour.XYZ_to_RGB(
-        xyz,
-        colour.models.RGB_COLOURSPACE_sRGB,
-        apply_cctf_encoding=False,
-    ).astype(np.float32)
-    linear_t = torch.from_numpy(linear).to(device=lab.device, dtype=lab.dtype).reshape(lab.shape[0], lab.shape[2], lab.shape[3], 3).permute(0, 3, 1, 2)
-    return linear_to_srgb(linear_t)
+    l, a, b = lab.unbind(dim=1)
+    l_ = l + 0.3963377774 * a + 0.2158037573 * b
+    m_ = l - 0.1055613458 * a - 0.0638541728 * b
+    s_ = l - 0.0894841775 * a - 1.2914855480 * b
+    l3, m3, s3 = l_.pow(3.0), m_.pow(3.0), s_.pow(3.0)
+    linear = torch.stack(
+        (
+            4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
+            -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
+            -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3,
+        ),
+        dim=1,
+    )
+    return linear_to_srgb(linear)
 
 
 def soft_gamut_compress(rgb: Tensor) -> Tensor:
     return rgb.clamp(0.0, 1.0)
 
 
-def flatten_rgb(img: Tensor) -> Tensor:
-    return img.permute(0, 2, 3, 1).reshape(-1, 3)
+def rgb_to_lab_np(rgb: np.ndarray) -> np.ndarray:
+    cs = RGB_COLOURSPACES["sRGB"]
+    xyz = RGB_to_XYZ(rgb, cs, apply_cctf_decoding=True)
+    return XYZ_to_Lab(xyz, cs.whitepoint)
 
 
-def identity_lut_linear(size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-    axis = torch.linspace(0.0, 1.0, int(size), device=device, dtype=dtype)
-    rr, gg, bb = torch.meshgrid(axis, axis, axis, indexing="ij")
-    return torch.stack((rr, gg, bb), dim=0)
+def lab_to_rgb_np(lab: np.ndarray) -> np.ndarray:
+    cs = RGB_COLOURSPACES["sRGB"]
+    xyz = colour.Lab_to_XYZ(lab, cs.whitepoint)
+    rgb = XYZ_to_RGB(xyz, cs, apply_cctf_encoding=True)
+    return np.clip(rgb, 0.0, 1.0)
 
 
-def fit_linear_rgb_lut(source_linear: Tensor, reference_linear: Tensor, cfg: GlobalMatchingConfig) -> Tuple[Tensor, Tensor]:
-    size = int(cfg.lut_size)
-    src = flatten_rgb(source_linear)
-    ref = flatten_rgb(reference_linear)
-    pos = src.clamp(0.0, 1.0) * float(size - 1)
-    base = torch.floor(pos).long().clamp(0, size - 1)
-    frac = pos - base.to(src.dtype)
-    upper = (base + 1).clamp(0, size - 1)
-
-    value_sum = torch.zeros((3, size, size, size), device=src.device, dtype=src.dtype)
-    weight_sum = torch.zeros((size, size, size), device=src.device, dtype=src.dtype)
-
-    for ri, rw in ((base[:, 0], 1.0 - frac[:, 0]), (upper[:, 0], frac[:, 0])):
-        for gi, gw in ((base[:, 1], 1.0 - frac[:, 1]), (upper[:, 1], frac[:, 1])):
-            for bi, bw in ((base[:, 2], 1.0 - frac[:, 2]), (upper[:, 2], frac[:, 2])):
-                weight = (rw * gw * bw).clamp_min(0.0)
-                flat_idx = (ri * size + gi) * size + bi
-                weight_sum.reshape(-1).index_add_(0, flat_idx, weight)
-                for channel in range(3):
-                    value_sum[channel].reshape(-1).index_add_(0, flat_idx, ref[:, channel] * weight)
-
-    support = weight_sum
-    mean_lut = value_sum / support.clamp_min(1e-6).unsqueeze(0)
-    filled = smooth_lut_values(mean_lut, support, cfg)
-    protected = protect_neutral_lut(identity_lut_linear(size, src.device, src.dtype), filled, cfg)
-    _ = colour.LUT3D(protected.permute(1, 2, 3, 0).detach().cpu().numpy(), size=size, name="LookAlign V0.3.6")
-    return protected, support
+def matched_channel(values: np.ndarray, source_samples: np.ndarray, reference_samples: np.ndarray) -> np.ndarray:
+    source_sorted = np.sort(np.asarray(source_samples, dtype=np.float64))
+    reference_sorted = np.sort(np.asarray(reference_samples, dtype=np.float64))
+    source_percentiles = np.linspace(0.0, 1.0, source_sorted.size)
+    reference_percentiles = np.linspace(0.0, 1.0, reference_sorted.size)
+    source_cdf = np.interp(values, source_sorted, source_percentiles, left=0.0, right=1.0)
+    return np.interp(source_cdf, reference_percentiles, reference_sorted)
 
 
-def smooth_lut_values(values: Tensor, support: Tensor, cfg: GlobalMatchingConfig) -> Tensor:
-    x = values
-    for _ in range(3):
-        x = (
-            x
-            + torch.roll(x, shifts=1, dims=1)
-            + torch.roll(x, shifts=-1, dims=1)
-            + torch.roll(x, shifts=1, dims=2)
-            + torch.roll(x, shifts=-1, dims=2)
-            + torch.roll(x, shifts=1, dims=3)
-            + torch.roll(x, shifts=-1, dims=3)
-        ) / 7.0
-    support_norm = support / support.max().clamp_min(1e-6)
-    mix = support_norm.unsqueeze(0).clamp(0.0, 1.0)
-    weak = float(np.clip(cfg.weak_cell_mix, 0.0, 1.0))
-    return values * mix + x * (1.0 - mix) * weak
+def build_lab_lut(source_rgb: np.ndarray, reference_rgb: np.ndarray, size: int) -> LUT3D:
+    source_lab = rgb_to_lab_np(source_rgb.reshape(-1, 3))
+    reference_lab = rgb_to_lab_np(reference_rgb.reshape(-1, 3))
+    grid = np.linspace(0.0, 1.0, int(size), dtype=np.float64)
+    rr, gg, bb = np.meshgrid(grid, grid, grid, indexing="ij")
+    rgb_grid = np.stack([rr, gg, bb], axis=-1).reshape(-1, 3)
+    lab_grid = rgb_to_lab_np(rgb_grid)
+    matched_lab = np.empty_like(lab_grid)
+    for channel in range(3):
+        matched_lab[:, channel] = matched_channel(lab_grid[:, channel], source_lab[:, channel], reference_lab[:, channel])
+    lut_rgb = lab_to_rgb_np(matched_lab).reshape(int(size), int(size), int(size), 3)
+    return LUT3D(table=lut_rgb, domain=np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float64), name="LookAlign V0.3.6")
 
 
-def protect_neutral_lut(identity_linear: Tensor, lut_linear: Tensor, cfg: GlobalMatchingConfig) -> Tensor:
-    gray = identity_linear.mean(dim=0, keepdim=True)
-    chroma = (identity_linear - gray).norm(dim=0, keepdim=True)
-    neutral = (1.0 - (chroma / 0.10).clamp(0.0, 1.0)) * float(np.clip(cfg.neutral_protection, 0.0, 1.0))
-    max_delta = float(cfg.max_rgb_delta)
-    delta = (lut_linear - identity_linear).clamp(-max_delta, max_delta)
-    return (identity_linear + delta * (1.0 - neutral)).clamp(0.0, 1.0)
+def apply_lut_np(image_rgb: np.ndarray, lut: LUT3D) -> np.ndarray:
+    return np.clip(lut.apply(image_rgb.astype(np.float64)), 0.0, 1.0).astype(np.float32)
 
 
-def sample_lut_flat(lut: Tensor, rgb: Tensor) -> Tensor:
-    _, size, _, _ = lut.shape
-    pos = rgb.clamp(0.0, 1.0) * float(size - 1)
-    base = torch.floor(pos).long().clamp(0, size - 1)
-    frac = pos - base.to(rgb.dtype)
-    upper = (base + 1).clamp(0, size - 1)
-    flat_lut = lut.reshape(3, -1)
-    out = torch.zeros((rgb.shape[0], 3), device=rgb.device, dtype=rgb.dtype)
-    for ri, rw in ((base[:, 0], 1.0 - frac[:, 0]), (upper[:, 0], frac[:, 0])):
-        for gi, gw in ((base[:, 1], 1.0 - frac[:, 1]), (upper[:, 1], frac[:, 1])):
-            for bi, bw in ((base[:, 2], 1.0 - frac[:, 2]), (upper[:, 2], frac[:, 2])):
-                idx = (ri * size + gi) * size + bi
-                out = out + flat_lut[:, idx].transpose(0, 1) * (rw * gw * bw).unsqueeze(1)
-    return out
-
-
-def apply_lut_linear(lut: Tensor, img_linear: Tensor, chunk_pixels: int) -> Tensor:
-    flat = flatten_rgb(img_linear)
-    chunks = []
-    for start in range(0, int(flat.shape[0]), int(chunk_pixels)):
-        chunks.append(sample_lut_flat(lut, flat[start : start + int(chunk_pixels)]))
-    out = torch.cat(chunks, dim=0).reshape(img_linear.shape[0], img_linear.shape[2], img_linear.shape[3], 3)
-    return out.permute(0, 3, 1, 2).contiguous().clamp(0.0, 1.0)
-
-
-def support_visual(support: Tensor) -> np.ndarray:
-    support = support / support.max().clamp_min(1e-6)
-    return support.max(dim=2).values.detach().cpu().numpy().astype(np.float32)
+def support_visual(size: int) -> np.ndarray:
+    return np.ones((size, size), dtype=np.float32)
 
 
 def image_stats_from_lab(src_lab: Tensor, out_lab: Tensor, out_rgb: Tensor) -> Dict[str, float]:
@@ -252,19 +208,17 @@ def run_global_matching(
     reference_resized = resize_to_hw(reference, source.shape[2], source.shape[3])
     source_fit = resize_long_edge(source, cfg.fit_long_edge)
     reference_fit = resize_to_hw(reference_resized, source_fit.shape[2], source_fit.shape[3])
-    source_linear = srgb_to_linear(source)
-    reference_linear = srgb_to_linear(reference_resized)
-    source_fit_linear = srgb_to_linear(source_fit)
-    reference_fit_linear = srgb_to_linear(reference_fit)
+    source_fit_np = to_hwc_np(source_fit)
+    reference_fit_np = to_hwc_np(reference_fit)
     timings["load_and_resize"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    lut_linear, support = fit_linear_rgb_lut(source_fit_linear, reference_fit_linear, cfg)
+    lut = build_lab_lut(source_fit_np, reference_fit_np, cfg.lut_size)
     timings["fit_lut"] = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    base_linear = apply_lut_linear(lut_linear, source_linear, cfg.apply_chunk_pixels)
-    base_rgb = soft_gamut_compress(linear_to_srgb(base_linear))
+    base_np = apply_lut_np(source_np, lut)
+    base_rgb = to_nchw_mps(base_np, device)
     base_lab = rgb_to_oklab(base_rgb)
     source_lab = rgb_to_oklab(source)
     reference_resized_lab = rgb_to_oklab(reference_resized)
@@ -277,10 +231,10 @@ def run_global_matching(
         "lut_support": str(output_dir / "lut_support.png"),
         "metrics": str(output_dir / "metrics.json"),
     }
-    save_rgb(paths["base_intermediate"], to_hwc_np(base_rgb))
+    save_rgb(paths["base_intermediate"], base_np)
     save_rgb(paths["reference_resized"], to_hwc_np(reference_resized))
-    save_rgb(paths["source_fit"], to_hwc_np(source_fit))
-    save_gray(paths["lut_support"], support_visual(support))
+    save_rgb(paths["source_fit"], source_fit_np)
+    save_gray(paths["lut_support"], support_visual(cfg.lut_size))
 
     stats = image_stats_from_lab(source_lab, base_lab, base_rgb)
     metrics: Dict[str, Any] = {
@@ -292,7 +246,7 @@ def run_global_matching(
         "reference_shape": list(reference_np.shape),
         "fit_shape": [int(source_fit.shape[2]), int(source_fit.shape[3]), 3],
         "config": asdict(cfg),
-        "lut_support_coverage": float((support > 0).float().mean().detach().cpu()),
+        "lut_support_coverage": 1.0,
         "timings": timings,
         **stats,
         "paths": paths,
