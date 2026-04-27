@@ -1,5 +1,9 @@
 # LookAlign V0.3.6
 
+LookAlign is for AI-assisted color editing and color grading. It takes a source image and a reference image, then pushes the source toward the reference look while trying to keep the original structure and detail intact.
+
+Use it by opening the local app, loading source/reference images, and running the current pipeline.
+
 ## Versions
 
 - `V0.3.6`: replaces the old OT/SVD global stage with a simple linear-RGB 3D LUT fit, then runs LightGlue+ALIKED first in local matching, warps the reference into base coordinates, and applies dense aligned OKLab diffuse luma/hue/chroma corrections with residual/specular confidence.
