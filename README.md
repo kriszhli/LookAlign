@@ -1,6 +1,10 @@
 # LookAlign V0.3.6
 
-LookAlign is a high-performance color matching system that transfers the visual style of an AI-generated reference onto a source image while preserving all original details and structure. It combines spatially-aware matching with deterministic color transforms to achieve accurate results even when the reference contains extreme AI artifacts. Designed for near real-time performance, LookAlign is built for modern image and video workflows where precision and speed both matter.
+LookAlign is a high-performance color-matching system that transfers the visual style of an AI-generated reference onto a source image while preserving all original details and structure. 
+
+It combines **spatially-aware matching** with **deterministic color transforms** to achieve accurate results even when the reference contains extreme AI artifacts. 
+
+Designed for near real-time performance, LookAlign is built for modern image and video workflows where precision and speed both matter.
 
 ## Versions
 
@@ -11,4 +15,4 @@ LookAlign is a high-performance color matching system that transfers the visual 
 - `V0.2.6` - Improved `SA-LUT` (`Lab` deltas, `33^3` LUT, neutral fix, dithering) with updated debug views.
 - `V0.2.5` - Simplified pipeline: `SA-LUT` as sole global stage + residual luminance/color local maps.
 - `V0.2` - Introduced `SA-LUT`-style 4D LUT (`context + RGB`) with `MPS` acceleration and unchanged downstream pipeline.
-- `V0.1` - Initial pipeline: **low-frequency transfer** -> **trust map** -> **reconstruction** with anti-fade safeguards.
+- `V0.1` - Initial pipeline: low-frequency transfer -> trust map -> reconstruction with anti-fade safeguards.
