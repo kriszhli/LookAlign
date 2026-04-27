@@ -213,6 +213,7 @@ def run_lightglue_matches_on_device(base_rgb: Tensor, ref_rgb: Tensor, cfg: Loca
             "score_filtered_count": 0,
             "inlier_count": 0,
             "device": actual_device,
+            "homography": None,
         }
 
     points0 = feats0["keypoints"][matches[:, 0]]
@@ -236,7 +237,7 @@ def run_lightglue_matches_on_device(base_rgb: Tensor, ref_rgb: Tensor, cfg: Loca
 
         p0_np = (points0.detach().cpu().numpy() / max(base_scale, 1e-6)).astype(np.float32)
         p1_np = (points1.detach().cpu().numpy() / max(ref_scale, 1e-6)).astype(np.float32)
-        _, mask = cv2.findHomography(p0_np, p1_np, cv2.RANSAC, float(cfg.ransac_reproj_threshold))
+        homography, mask = cv2.findHomography(p0_np, p1_np, cv2.RANSAC, float(cfg.ransac_reproj_threshold))
         if mask is None:
             inlier_mask = np.ones((score_filtered_count,), dtype=bool)
         else:
@@ -256,6 +257,7 @@ def run_lightglue_matches_on_device(base_rgb: Tensor, ref_rgb: Tensor, cfg: Loca
         "score_filtered_count": score_filtered_count,
         "inlier_count": int(base_points.shape[0]),
         "device": actual_device,
+        "homography": homography if score_filtered_count >= 4 else None,
     }
 
 
@@ -295,6 +297,30 @@ def proxy_delta_maps(base_proxy: Tensor, ref_proxy: Tensor, cfg: LocalMatchingCo
         float(cfg.min_diffuse_chroma_scale), float(cfg.max_diffuse_chroma_scale)
     )
     return {"luma_delta": luma_delta, "hue_delta": hue_delta, "chroma_scale": chroma_scale}
+
+
+def warp_reference_to_base(img: Tensor, homography: Any, height: int, width: int) -> tuple[Tensor, Tensor]:
+    if homography is None:
+        valid = torch.zeros((1, 1, height, width), device=img.device, dtype=img.dtype)
+        return resize_to_hw_unclamped(img, height, width), valid
+    h = torch.as_tensor(homography, device=img.device, dtype=img.dtype)
+    _, _, ref_h, ref_w = img.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=img.device, dtype=img.dtype),
+        torch.arange(width, device=img.device, dtype=img.dtype),
+        indexing="ij",
+    )
+    ones = torch.ones_like(xx)
+    base = torch.stack((xx.reshape(-1), yy.reshape(-1), ones.reshape(-1)), dim=0)
+    ref = h @ base
+    ref_x = ref[0] / ref[2].clamp_min(1e-6)
+    ref_y = ref[1] / ref[2].clamp_min(1e-6)
+    valid = ((ref_x >= 0.0) & (ref_x <= float(ref_w - 1)) & (ref_y >= 0.0) & (ref_y <= float(ref_h - 1))).to(img.dtype)
+    grid_x = ref_x / max(ref_w - 1, 1) * 2.0 - 1.0
+    grid_y = ref_y / max(ref_h - 1, 1) * 2.0 - 1.0
+    grid = torch.stack((grid_x, grid_y), dim=1).view(1, height, width, 2)
+    warped = F.grid_sample(img, grid, mode="bilinear", align_corners=True)
+    return warped, valid.view(1, 1, height, width)
 
 
 def confidence_weighted_mean(value: Tensor, confidence: Tensor, default: float) -> Tensor:
@@ -473,6 +499,47 @@ def lightglue_delta_maps(
         "fallback_ratio": fallback_ratio,
     }
     return dense, stats, samples
+
+
+def aligned_proxy_delta_maps(
+    base_proxy: Tensor,
+    ref_proxy: Tensor,
+    confidence: Dict[str, Tensor],
+    matches: Dict[str, Any],
+    cfg: LocalMatchingConfig,
+) -> tuple[Dict[str, Tensor], Dict[str, Any], Dict[str, Tensor]]:
+    _, _, height, width = base_proxy.shape
+    if matches.get("homography") is None or int(matches["inlier_count"]) < int(cfg.min_valid_matches):
+        fallback = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
+        empty = torch.empty((0,), device=base_proxy.device, dtype=base_proxy.dtype)
+        samples = {
+            "base_points": torch.empty((0, 2), device=base_proxy.device, dtype=base_proxy.dtype),
+            "luma_delta": empty,
+            "hue_delta": empty,
+            "chroma_scale": empty,
+        }
+        stats = {"sparse_sample_count": 0, "match_density_mean": 0.0, "fallback_ratio": 1.0}
+        return fallback, stats, samples
+
+    aligned_ref_proxy, warp_valid = warp_reference_to_base(ref_proxy, matches["homography"], height, width)
+    delta_maps = proxy_delta_maps(base_proxy, aligned_ref_proxy, cfg)
+    aligned_ref_conf, _ = warp_reference_to_base(confidence["ref_residual_confidence"], matches["homography"], height, width)
+    density = (warp_valid * aligned_ref_conf).clamp(0.0, 1.0)
+    fallback = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
+    blend = smoothstep(cfg.sparse_density_blend_low, cfg.sparse_density_blend_high, density)
+    dense = {
+        "luma_delta": delta_maps["luma_delta"] * blend + fallback["luma_delta"] * (1.0 - blend),
+        "hue_delta": delta_maps["hue_delta"] * blend + fallback["hue_delta"] * (1.0 - blend),
+        "chroma_scale": delta_maps["chroma_scale"] * blend + fallback["chroma_scale"] * (1.0 - blend),
+        "match_density": density,
+    }
+    sparse_samples = sample_delta_candidates(base_proxy, ref_proxy, confidence, matches, cfg)
+    stats = {
+        "sparse_sample_count": int(sparse_samples["base_points"].shape[0]),
+        "match_density_mean": float(density.mean().detach().cpu()),
+        "fallback_ratio": float((density < float(cfg.sparse_density_blend_high)).float().mean().detach().cpu()),
+    }
+    return dense, stats, sparse_samples
 
 
 def tensor_rgb_to_uint8(img: Tensor) -> np.ndarray:
@@ -673,8 +740,8 @@ def run_local_diffuse_matching(
 
     t_interp = time.perf_counter()
     if int(matches["inlier_count"]) >= int(cfg.min_valid_matches):
-        delta_maps, sparse_stats, sparse_samples = lightglue_delta_maps(base_proxy, ref_proxy, confidence, matches, cfg)
-        local_mode = "lightglue"
+        delta_maps, sparse_stats, sparse_samples = aligned_proxy_delta_maps(base_proxy, ref_proxy, confidence, matches, cfg)
+        local_mode = "lightglue_aligned_proxy"
     else:
         delta_maps = global_fallback_maps(base_proxy, ref_proxy, confidence, cfg)
         sparse_samples = {
