@@ -4,11 +4,11 @@ LookAlign is a high-performance color matching system that transfers the visual 
 
 ## Versions
 
-- `V0.3.6`: replaces the old OT/SVD global stage with a simple linear-RGB 3D LUT fit, then runs LightGlue+ALIKED first in local matching, warps the reference into base coordinates, and applies dense aligned OKLab diffuse luma/hue/chroma corrections with residual/specular confidence.
-- `V0.3.5`: uses global OT/SVD for the OKLab `base_intermediate`, then LightGlue+ALIKED correspondences guide sparse diffuse-shading luma/hue/chroma samples from the reference into smooth MPS local correction maps with residual/specular confidence, match-density fallback, and debug views.
-- `V0.3.1`: replaces the rejected V0.3 global-LUT/BGrid prototype with an MPS-required sliced partial OT color transport stage distilled into an SVD-smoothed LUT. The output is a conservative base intermediate for a future CNN local affine field.
-- `V0.3.0`: a complete remake of LookAlign. The pipeline now uses ML models to learn the appearance transform directly from source/reference pairs instead of relying on manual calculations or SA-LUT-style lookup fitting. This release shifts the core workflow from hand-designed correction logic to a learned global LUT fitting approach, with the UI and metrics updated to match the new model-driven pipeline.
-- `V0.2.6`: updates SA-LUT to use identity RGB lookup coordinates and fit Lab deltas instead of absolute RGB outputs, increases the default LUT size to `33`, fixes neutral detection around centered Lab `a/b`, and adds deterministic save-time dithering. The Gradio UI now shows V0.2.6 base and light-map debug views.
-- `V0.2.5`: makes SA-LUT the only global base match and replaces legacy local grid correction with residual luminance/color maps fitted after SA-LUT.
-- `V0.2`: replaces the global match with a locally fitted SA-LUT-style 4D LUT (`context + RGB`) applied through PyTorch MPS when available, with CPU fallback. Alignment, local correction, reconstruction, and anti-fade guards remain the same.
-- `V0.1`: `low-frequency transfer -> trust map -> reconstruction`, with anti-fade guards to keep contrast and saturation usable.
+- `V0.3.6` - Switched to linear-RGB 3D LUT global fit; `LightGlue`+`ALIKED`-first local alignment with warped reference and dense OKLab diffuse corrections + confidence.
+- `V0.3.5` - Global `OT`/`SVD` base with `LightGlue`+`ALIKED`-guided sparse sampling into smooth `MPS` local OKLab correction maps + confidence and fallback.
+- `V0.3.1` - Replaced global LUT/`BGrid` with sliced partial `OT` -> `SVD`-smoothed LUT, producing a conservative base intermediate.
+- `V0.3.0` - Full redesign to ML-driven appearance transform from source/reference pairs with learned global LUT fitting.
+- `V0.2.6` - Improved `SA-LUT` (`Lab` deltas, `33^3` LUT, neutral fix, dithering) with updated debug views.
+- `V0.2.5` - Simplified pipeline: `SA-LUT` as sole global stage + residual luminance/color local maps.
+- `V0.2` - Introduced `SA-LUT`-style 4D LUT (`context + RGB`) with `MPS` acceleration and unchanged downstream pipeline.
+- `V0.1` - Initial pipeline: **low-frequency transfer** -> **trust map** -> **reconstruction** with anti-fade safeguards.
