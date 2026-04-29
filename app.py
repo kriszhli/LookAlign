@@ -9,6 +9,8 @@ from typing import Optional, Tuple
 
 import gradio as gr
 from PIL import Image
+import base64
+from io import BytesIO
 
 from scripts.global_matching import GlobalMatchingConfig, run_global_matching
 from scripts.local_matching import LocalMatchingConfig, run_local_diffuse_matching
@@ -71,21 +73,48 @@ def make_composite(src_path: Path, ref_path: Path) -> Image.Image:
     comp.paste(ref_half, (w // 2, 0))
     return comp
 
-EXAMPLE_PAIRS: list[Tuple[Path, Path]] = []
+def pil_to_base64(img: Image.Image) -> str:
+    buffered = BytesIO()
+    img.save(buffered, format="JPEG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/jpeg;base64,{img_str}"
 
-def get_gallery_items():
-    global EXAMPLE_PAIRS
-    EXAMPLE_PAIRS = get_example_pairs()
-    items = []
-    for src, ref in EXAMPLE_PAIRS:
-        items.append((make_composite(src, ref), f"{src.name} | {ref.name}"))
-    return items
+class ExamplesGallery(gr.HTML):
+    def __init__(self, **kwargs):
+        self.pairs = get_example_pairs()
+        images_html = []
+        for i, (src, ref) in enumerate(self.pairs):
+            comp = make_composite(src, ref)
+            b64 = pil_to_base64(comp)
+            images_html.append(f'<img src="{b64}" data-idx="{i}" class="example-thumb" />')
+            
+        html_template = f'<div class="custom-gallery">{"".join(images_html)}</div>'
+        
+        css_template = """
+        .custom-gallery { display: flex; flex-wrap: wrap; gap: 15px; justify-content: flex-start; align-items: flex-start; }
+        .example-thumb { width: calc(18vw - 15px); aspect-ratio: 4/3; object-fit: cover; cursor: pointer; border-radius: 8px; transition: transform 0.2s; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .example-thumb:hover { transform: scale(1.02); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
+        """
+        
+        js_on_load = """
+            const imgs = element.querySelectorAll('.example-thumb');
+            imgs.forEach(img => {
+                img.addEventListener('click', () => {
+                    props.value = parseInt(img.getAttribute('data-idx'));
+                    trigger('change');
+                });
+            });
+        """
+        super().__init__(value=-1, html_template=html_template, css_template=css_template, js_on_load=js_on_load, **kwargs)
 
-def on_example_select(evt: gr.SelectData) -> Tuple[str, str]:
-    idx = evt.index
-    if idx < len(EXAMPLE_PAIRS):
-        return str(EXAMPLE_PAIRS[idx][0]), str(EXAMPLE_PAIRS[idx][1])
-    return None, None
+    def get_pair(self, idx: int) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            idx = int(idx)
+            if 0 <= idx < len(self.pairs):
+                return str(self.pairs[idx][0]), str(self.pairs[idx][1])
+        except (ValueError, TypeError):
+            pass
+        return None, None
 
 def choose_input(path: Optional[str], default: Path, label: str) -> str:
     if path:
@@ -158,36 +187,23 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
 
 
 css = """
-#examples-gallery button {
-    aspect-ratio: 4/3 !important;
-    height: auto !important;
-}
+/* No global CSS needed for gallery, handled by ExamplesGallery custom component */
 """
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="LookAlign V0.4", css=css) as demo:
+    with gr.Blocks(title="LookAlign V0.4") as demo:
         gr.Markdown("# LookAlign V0.4 — Bilateral Grid Affine Transfer")
+
+        gr.Markdown("### Examples")
+        examples_gallery = ExamplesGallery()
 
         with gr.Row():
             source_image = gr.Image(label="Source image", type="filepath", value=existing_path(DEFAULT_SOURCE), interactive=True)
             reference_image = gr.Image(label="Reference image", type="filepath", value=existing_path(DEFAULT_REFERENCE), interactive=True)
 
-        gr.Markdown("### Examples")
-        examples_gallery = gr.Gallery(
-            value=get_gallery_items(),
-            label="Examples",
-            show_label=False,
-            columns=5,
-            rows=1,
-            height="auto",
-            allow_preview=False,
-            object_fit="cover",
-            elem_id="examples-gallery",
-            format="png"
-        )
-        examples_gallery.select(
-            fn=on_example_select,
-            inputs=[],
+        examples_gallery.change(
+            fn=examples_gallery.get_pair,
+            inputs=[examples_gallery],
             outputs=[source_image, reference_image]
         )
 
@@ -260,4 +276,4 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    build_app().launch()
+    build_app().launch(css=css)
