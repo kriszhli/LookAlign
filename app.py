@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import gradio as gr
+from PIL import Image
 
 from scripts.global_matching import GlobalMatchingConfig, run_global_matching
 from scripts.local_matching import LocalMatchingConfig, run_local_diffuse_matching
@@ -23,6 +24,68 @@ OUTPUTS_DIR = ROOT / "outputs"
 def existing_path(path: Path) -> Optional[str]:
     return str(path) if path.exists() else None
 
+def get_example_pairs() -> list[Tuple[Path, Path]]:
+    inputs_dir = ROOT / "inputs"
+    if not inputs_dir.exists():
+        return []
+    
+    sources = list(inputs_dir.glob("source*.*"))
+    pairs = []
+    for src in sorted(sources):
+        if not src.is_file():
+            continue
+        name = src.stem
+        if name.startswith("source"):
+            suffix = name[len("source"):]
+            refs = [r for r in inputs_dir.glob(f"reference{suffix}.*") if r.is_file()]
+            if refs:
+                pairs.append((src, refs[0]))
+    return pairs
+
+def make_composite(src_path: Path, ref_path: Path) -> Image.Image:
+    w, h = 800, 600
+    try:
+        src_img = Image.open(src_path).convert("RGB")
+        ref_img = Image.open(ref_path).convert("RGB")
+    except Exception:
+        return Image.new("RGB", (w, h))
+    
+    def resize_crop(img: Image.Image, tw: int, th: int) -> Image.Image:
+        img_ratio = img.width / img.height
+        target_ratio = tw / th
+        if img_ratio > target_ratio:
+            new_w = int(img.height * target_ratio)
+            left = (img.width - new_w) // 2
+            img = img.crop((left, 0, left + new_w, img.height))
+        else:
+            new_h = int(img.width / target_ratio)
+            top = (img.height - new_h) // 2
+            img = img.crop((0, top, img.width, top + new_h))
+        return img.resize((tw, th), Image.Resampling.LANCZOS)
+    
+    src_half = resize_crop(src_img, w // 2, h)
+    ref_half = resize_crop(ref_img, w // 2, h)
+    
+    comp = Image.new("RGB", (w, h))
+    comp.paste(src_half, (0, 0))
+    comp.paste(ref_half, (w // 2, 0))
+    return comp
+
+EXAMPLE_PAIRS: list[Tuple[Path, Path]] = []
+
+def get_gallery_items():
+    global EXAMPLE_PAIRS
+    EXAMPLE_PAIRS = get_example_pairs()
+    items = []
+    for src, ref in EXAMPLE_PAIRS:
+        items.append((make_composite(src, ref), f"{src.name} | {ref.name}"))
+    return items
+
+def on_example_select(evt: gr.SelectData) -> Tuple[str, str]:
+    idx = evt.index
+    if idx < len(EXAMPLE_PAIRS):
+        return str(EXAMPLE_PAIRS[idx][0]), str(EXAMPLE_PAIRS[idx][1])
+    return None, None
 
 def choose_input(path: Optional[str], default: Path, label: str) -> str:
     if path:
@@ -94,13 +157,39 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
     )
 
 
+css = """
+#examples-gallery button {
+    aspect-ratio: 4/3 !important;
+    height: auto !important;
+}
+"""
+
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="LookAlign V0.4") as demo:
+    with gr.Blocks(title="LookAlign V0.4", css=css) as demo:
         gr.Markdown("# LookAlign V0.4 — Bilateral Grid Affine Transfer")
 
         with gr.Row():
             source_image = gr.Image(label="Source image", type="filepath", value=existing_path(DEFAULT_SOURCE), interactive=True)
             reference_image = gr.Image(label="Reference image", type="filepath", value=existing_path(DEFAULT_REFERENCE), interactive=True)
+
+        gr.Markdown("### Examples")
+        examples_gallery = gr.Gallery(
+            value=get_gallery_items(),
+            label="Examples",
+            show_label=False,
+            columns=5,
+            rows=1,
+            height="auto",
+            allow_preview=False,
+            object_fit="cover",
+            elem_id="examples-gallery",
+            format="png"
+        )
+        examples_gallery.select(
+            fn=on_example_select,
+            inputs=[],
+            outputs=[source_image, reference_image]
+        )
 
         # ---- V0.4 tab ----
         with gr.Tab("V0.4 Bilateral Grid"):
