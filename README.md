@@ -1,4 +1,4 @@
-# LookAlign V0.4
+# LookAlign V0.4.3
 
 LookAlign is a high-performance color-matching system that transfers the visual style of an AI-generated reference onto a source image while preserving all original details and structure. 
 
@@ -8,6 +8,7 @@ Designed for near real-time performance, LookAlign is built for modern image and
 
 ## Versions
 
+- `V0.4.3` - Replaced the SA-LUT global stage with **Neural Preset / DNCM** global matching. The UI contract is unchanged: Neural Preset writes `base_intermediate.png`, then the existing bilateral transfer stage produces the final output.
 - `V0.4.2` - Fixed "washed out" issue by restricting the bilateral grid to correct **chrominance (a/b) only**. The global 3D LUT already perfectly matches the L percentiles, and applying per-cell L offsets was compressing the tonal range. Removed the global Reinhard standard deviation matching which was increasing pixel-wise error.
 - `V0.4.1` - Reference denoising before bilateral grid splatting. AI-generated film-style references contain grain noise that biases per-cell means (especially lifting shadows). A configurable Gaussian blur (`ref_denoise_sigma=1.0`) suppresses grain while preserving broad color patterns.
 - `V0.4.0` - Replaced low-frequency proxy deltas with **bilateral-grid local affine** transfer. Edge-awareness built into the grid structure (luminance-binned cells); misalignment tolerance via statistics-based cell fitting. Mean-shift-only per cell + global Reinhard std-match. Eliminates `LightGlue` dependency, reduces hyperparameters to 9, runs in ~0.3s on MPS.

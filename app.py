@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Gradio UI for LookAlign V0.4 + V0.3.6 comparison."""
+"""Local Gradio UI for LookAlign V0.4.3 + V0.3.6 comparison."""
 
 from __future__ import annotations
 
@@ -189,8 +189,8 @@ css = """
 """
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="LookAlign V0.4") as demo:
-        gr.Markdown("# LookAlign V0.4 — Bilateral Grid Affine Transfer")
+    with gr.Blocks(title="LookAlign V0.4.3") as demo:
+        gr.Markdown("# LookAlign V0.4.3 — Neural Preset + Bilateral Transfer")
 
         gr.Markdown("### Examples")
         examples_gallery = ExamplesGallery()
@@ -205,14 +205,14 @@ def build_app() -> gr.Blocks:
             outputs=[source_image, reference_image]
         )
 
-        # ---- V0.4 tab ----
-        with gr.Tab("V0.4 Bilateral Grid"):
-            run_v040_btn = gr.Button("Run V0.4", variant="primary")
+        # ---- V0.4.3 tab ----
+        with gr.Tab("V0.4.3 Bilateral Grid"):
+            run_v040_btn = gr.Button("Run V0.4.3", variant="primary")
 
             gr.Markdown("## Outputs")
             with gr.Row():
-                v4_base = gr.Image(label="Base intermediate (after 3D LUT)", type="filepath")
-                v4_final = gr.Image(label="V0.4 Final output", type="filepath")
+                v4_base = gr.Image(label="Base intermediate (after Neural Preset)", type="filepath")
+                v4_final = gr.Image(label="V0.4.3 Final output", type="filepath")
 
             gr.Markdown("## Alignment and Difference")
             with gr.Row():
