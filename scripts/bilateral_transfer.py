@@ -38,15 +38,14 @@ PIPELINE_VERSION = "v0.4.0-bilateral-grid-affine"
 
 @dataclass
 class BilateralTransferConfig:
-    fit_long_edge: int = 384
-    spatial_bins: int = 16          # grid cells along the long edge
-    luma_bins: int = 12             # luminance bins
-    stats_blur_sigma_xy: float = 1.5
-    stats_blur_sigma_l: float = 1.0
-    affine_regularization: float = 0.10  # pull toward identity
+    fit_long_edge: int = 512
+    spatial_bins: int = 32          # grid cells along the long edge
+    luma_bins: int = 16             # luminance bins
+    stats_blur_sigma_xy: float = 1.0
+    stats_blur_sigma_l: float = 0.8
+    affine_regularization: float = 0.05  # pull toward identity
     min_samples_per_cell: int = 4
-    max_scale: float = 2.0              # clamp affine scale per channel (a/b only)
-    max_offset: float = 0.15            # clamp affine offset (OKLab units)
+    max_offset: float = 0.20            # clamp affine offset (OKLab units)
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -191,13 +190,11 @@ def solve_diagonal_affine(
     stats: Dict[str, Tensor],
     cfg: BilateralTransferConfig,
 ) -> Tensor:
-    """Solve per-channel scale+offset from blurred statistics.
+    """Solve per-channel mean-shift from blurred statistics.
 
-    For the L channel: mean-shift only (scale=1), because the bilateral grid
-    already bins by luminance so intra-cell L variance is dominated by bin
-    quantisation noise — std-matching gives unstable, extreme scales.
-
-    For a/b channels: full mean+std matching (Reinhard-style).
+    All channels use mean-shift only (scale=1) in the bilateral grid.
+    Intra-cell variance is too small and noisy for reliable std-matching;
+    the global Reinhard std-match is applied as a separate post-step.
 
     Returns (gh, gw, gl, 12) grid of flattened 3×4 diagonal affine matrices.
     """
@@ -205,47 +202,26 @@ def solve_diagonal_affine(
     gh, gw, gl = stats["count"].shape
 
     count = stats["count"].clamp_min(1)
-    mu_b = stats["sum_base"] / count.unsqueeze(-1)
+    mu_b = stats["sum_base"] / count.unsqueeze(-1)  # (gh, gw, gl, 3)
     mu_r = stats["sum_ref"] / count.unsqueeze(-1)
-    var_b = (stats["ssq_base"] / count.unsqueeze(-1) - mu_b ** 2).clamp_min(1e-8)
-    var_r = (stats["ssq_ref"] / count.unsqueeze(-1) - mu_r ** 2).clamp_min(1e-8)
 
-    sigma_b = var_b.sqrt()
-    sigma_r = var_r.sqrt()
+    # Per-cell offset = mean_ref - mean_base, clamped for safety
+    raw_offset = (mu_r - mu_b).clamp(-cfg.max_offset, cfg.max_offset)  # (gh,gw,gl,3)
 
-    # ---- L channel: mean-shift only (scale = 1.0) ----
-    L_scale = torch.ones(gh, gw, gl, device=device, dtype=dtype)
-    L_offset = (mu_r[..., 0] - mu_b[..., 0]).clamp(-cfg.max_offset, cfg.max_offset)
-
-    # ---- a/b channels: std-matching (Reinhard) ----
-    ab_raw_scale = sigma_r[..., 1:] / sigma_b[..., 1:].clamp_min(1e-6)
-    ab_raw_scale = ab_raw_scale.clamp(1.0 / cfg.max_scale, cfg.max_scale)
-    ab_raw_offset = mu_r[..., 1:] - ab_raw_scale * mu_b[..., 1:]
-    ab_raw_offset = ab_raw_offset.clamp(-cfg.max_offset, cfg.max_offset)
-
-    # Regularize toward identity for sparse cells
+    # Regularize: sparse cells → offset = 0, all cells → gentle pull toward 0
     lam = cfg.affine_regularization
-    sparse = (stats["count"] < cfg.min_samples_per_cell).float()
+    sparse = (stats["count"] < cfg.min_samples_per_cell).float().unsqueeze(-1)
+    offset = raw_offset * (1.0 - sparse) * (1.0 - lam)  # (gh, gw, gl, 3)
 
-    # L: regularize offset toward 0
-    L_offset = L_offset * (1.0 - sparse) * (1.0 - lam)
-
-    # a/b: regularize scale toward 1 and offset toward 0
-    sparse_ab = sparse.unsqueeze(-1)
-    ab_scale = ab_raw_scale * (1 - sparse_ab) + 1.0 * sparse_ab
-    ab_scale = ab_scale * (1 - lam) + 1.0 * lam
-    ab_offset = ab_raw_offset * (1 - sparse_ab)
-    ab_offset = ab_offset * (1 - lam)
-
-    # Pack into 3×4 diagonal affine: [[s_L, 0, 0, off_L], [0, s_a, 0, off_a], [0, 0, s_b, off_b]]
+    # Pack into 3×4 diagonal affine (scale=1 for all channels)
     # Row-major flat: row0=[0,1,2,3], row1=[4,5,6,7], row2=[8,9,10,11]
     grid = torch.zeros(gh, gw, gl, 12, device=device, dtype=dtype)
-    grid[..., 0] = L_scale             # A[0,0] = L scale (always 1.0)
-    grid[..., 3] = L_offset            # A[0,3] = L offset
-    grid[..., 5] = ab_scale[..., 0]    # A[1,1] = a scale
-    grid[..., 7] = ab_offset[..., 0]   # A[1,3] = a offset
-    grid[..., 10] = ab_scale[..., 1]   # A[2,2] = b scale
-    grid[..., 11] = ab_offset[..., 1]  # A[2,3] = b offset
+    grid[..., 0] = 1.0               # A[0,0] = L scale
+    grid[..., 3] = offset[..., 0]    # A[0,3] = L offset
+    grid[..., 5] = 1.0               # A[1,1] = a scale
+    grid[..., 7] = offset[..., 1]    # A[1,3] = a offset
+    grid[..., 10] = 1.0              # A[2,2] = b scale
+    grid[..., 11] = offset[..., 2]   # A[2,3] = b offset
     return grid
 
 
@@ -423,19 +399,25 @@ def run_bilateral_transfer(
     output_lab = bilateral_slice(source_lab, base_intermediate_lab, grid)
     timings["bilateral_slice"] = time.perf_counter() - t4
 
-    # ---- Stage 3b: global L contrast correction ----
-    # Per-bin L offsets compress the overall contrast (shadows up, highlights
-    # down).  Rescale L to match the reference L standard deviation.
+    # ---- Stage 3b: global Reinhard std-match for all channels ----
+    # The bilateral grid captures spatially-varying mean-shifts per cell.
+    # Intra-cell variance is too small for reliable per-cell std-matching,
+    # so we apply a single global std correction per channel (Reinhard) to
+    # match the reference distribution width.
     t_lc = time.perf_counter()
-    out_L = output_lab[:, 0:1]
-    out_L_mean = out_L.mean()
-    out_L_std = out_L.std().clamp_min(1e-6)
-    ref_L_std = reference_resized_lab[:, 0:1].std().clamp_min(1e-6)
-    output_lab = torch.cat([
-        ((out_L - out_L_mean) * (ref_L_std / out_L_std) + out_L_mean).clamp(0, 1),
-        output_lab[:, 1:],
-    ], dim=1)
-    timings["L_contrast_correction"] = time.perf_counter() - t_lc
+    for c in range(3):
+        out_c = output_lab[:, c:c+1]
+        ref_c = reference_resized_lab[:, c:c+1]
+        out_mean = out_c.mean()
+        out_std = out_c.std().clamp_min(1e-6)
+        ref_std = ref_c.std().clamp_min(1e-6)
+        corrected = (out_c - out_mean) * (ref_std / out_std) + out_mean
+        if c == 0:  # L channel: clamp to valid range
+            corrected = corrected.clamp(0, 1)
+        output_lab = torch.cat([
+            output_lab[:, :c], corrected, output_lab[:, c+1:]
+        ], dim=1)
+    timings["global_std_correction"] = time.perf_counter() - t_lc
 
     # ---- Optional guided-filter post-pass ----
     t5 = time.perf_counter()
@@ -466,10 +448,11 @@ def run_bilateral_transfer(
     save_rgb(paths["final_output"], to_hwc_np(output_rgb))
     # Upscale grid debug images to viewable size (grids are only ~16×12 px)
     debug_size = 256
-    save_gray(paths["grid_scale_L"], _grid_to_vis(grid, 0, debug_size))
-    save_gray(paths["grid_scale_a"], _grid_to_vis(grid, 5, debug_size))
-    save_gray(paths["grid_scale_b"], _grid_to_vis(grid, 10, debug_size))
-    save_gray(paths["grid_offset_L"], _grid_to_vis(grid, 3, debug_size))
+    # Scales are all 1.0 now (mean-shift only), so visualize offsets
+    save_gray(paths["grid_scale_L"], _grid_to_vis(grid, 3, debug_size))    # L offset
+    save_gray(paths["grid_scale_a"], _grid_to_vis(grid, 7, debug_size))    # a offset
+    save_gray(paths["grid_scale_b"], _grid_to_vis(grid, 11, debug_size))   # b offset
+    save_gray(paths["grid_offset_L"], _grid_to_vis(grid, 3, debug_size))   # L offset (dup)
     count_vis = stats["count"] / stats["count"].max().clamp_min(1)
     count_map = count_vis.mean(dim=2).detach().cpu().numpy().astype(np.float32)
     from PIL import Image as _PILImage
