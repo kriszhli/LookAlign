@@ -496,11 +496,36 @@ def run_bilateral_transfer(
     ref_rgb_np = ref_rgb[0].permute(1, 2, 0).detach().cpu().numpy()
     ref_rgb_warped_np = cv2.remap(ref_rgb_np, map_x_f, map_y_f, cv2.INTER_LINEAR)
     ref_rgb_warped = torch.from_numpy(ref_rgb_warped_np).permute(2, 0, 1).unsqueeze(0).to(ref_rgb.device)
-    
-    diff_map = (output_rgb - ref_rgb_warped).abs().mean(dim=1).squeeze(0).detach().cpu().numpy()
-    diff_norm = (np.clip(diff_map * 2.5, 0, 1) * 255).astype(np.uint8)
-    diff_heatmap = cv2.applyColorMap(diff_norm, cv2.COLORMAP_INFERNO)
-    diff_heatmap = cv2.cvtColor(diff_heatmap, cv2.COLOR_BGR2RGB)
+
+    ref_lab_warped = torch.from_numpy(
+        cv2.remap(
+            reference_resized_lab[0].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32),
+            map_x_f,
+            map_y_f,
+            cv2.INTER_LINEAR,
+        )
+    ).permute(2, 0, 1).unsqueeze(0).to(output_lab.device, dtype=output_lab.dtype)
+
+    out_chroma = output_lab[:, 1:3].norm(dim=1)
+    ref_chroma = ref_lab_warped[:, 1:3].norm(dim=1)
+    delta_l = (output_lab[:, 0] - ref_lab_warped[:, 0]) / 100.0
+    delta_c = (out_chroma - ref_chroma) / 100.0
+    signed_score = (0.65 * delta_l + 0.35 * delta_c).squeeze(0).detach().cpu().numpy()
+    magnitude = (0.85 * np.abs(delta_l.squeeze(0).detach().cpu().numpy()) + 0.15 * np.abs(delta_c.squeeze(0).detach().cpu().numpy()))
+    strength = np.clip(magnitude * 4.0, 0.0, 1.0)
+
+    base_gray = 128.0
+    red = base_gray + 127.0 * np.clip(signed_score, 0.0, 1.0) * strength
+    blue = base_gray + 127.0 * np.clip(-signed_score, 0.0, 1.0) * strength
+    gb = base_gray - 96.0 * strength
+    diff_heatmap = np.stack(
+        [
+            np.clip(red, 0, 255),
+            np.clip(gb, 0, 255),
+            np.clip(blue, 0, 255),
+        ],
+        axis=-1,
+    ).astype(np.uint8)
 
     # ---- Save outputs and debug images ----
     t6 = time.perf_counter()
