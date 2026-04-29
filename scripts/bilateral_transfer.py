@@ -452,32 +452,40 @@ def run_bilateral_transfer(
 
     output_rgb = soft_gamut_compress(oklab_to_rgb(output_lab))
 
+    # Compute aligned difference map for UI visualization ONLY
+    ref_rgb = global_metrics["tensors"]["reference_resized_rgb"]
+    import cv2
+    ref_L_full = (reference_resized_lab[0, 0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    out_L_full = (output_lab[0, 0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    inst = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    flow_full = inst.calc(ref_L_full, out_L_full, None)
+    
+    fh, fw = out_L_full.shape
+    map_x_f = np.tile(np.arange(fw), (fh, 1)).astype(np.float32) + flow_full[..., 0]
+    map_y_f = np.repeat(np.arange(fh), fw).reshape(fh, fw).astype(np.float32) + flow_full[..., 1]
+    
+    ref_rgb_np = ref_rgb[0].permute(1, 2, 0).detach().cpu().numpy()
+    ref_rgb_warped_np = cv2.remap(ref_rgb_np, map_x_f, map_y_f, cv2.INTER_LINEAR)
+    ref_rgb_warped = torch.from_numpy(ref_rgb_warped_np).permute(2, 0, 1).unsqueeze(0).to(ref_rgb.device)
+    
+    diff_map = (output_rgb - ref_rgb_warped).abs().mean(dim=1).squeeze(0).detach().cpu().numpy()
+    diff_norm = (np.clip(diff_map * 2.5, 0, 1) * 255).astype(np.uint8)
+    diff_heatmap = cv2.applyColorMap(diff_norm, cv2.COLORMAP_INFERNO)
+    diff_heatmap = cv2.cvtColor(diff_heatmap, cv2.COLOR_BGR2RGB)
+
     # ---- Save outputs and debug images ----
     t6 = time.perf_counter()
     paths = dict(global_metrics.get("paths", {}))
     paths.update({
         "final_output": str(output_dir / "final_output.png"),
-        "grid_scale_L": str(output_dir / "grid_scale_L.png"),
-        "grid_scale_a": str(output_dir / "grid_scale_a.png"),
-        "grid_scale_b": str(output_dir / "grid_scale_b.png"),
-        "grid_offset_L": str(output_dir / "grid_offset_L.png"),
-        "grid_cell_count": str(output_dir / "grid_cell_count.png"),
+        "diff_map": str(output_dir / "diff_map.png"),
         "metrics": str(output_dir / "metrics.json"),
     })
 
     save_rgb(paths["final_output"], to_hwc_np(output_rgb))
-    # Upscale grid debug images to viewable size (grids are only ~16×12 px)
-    debug_size = 256
-    # Scales are all 1.0 now (mean-shift only), so visualize offsets
-    save_gray(paths["grid_scale_L"], _grid_to_vis(grid, 3, debug_size))    # L offset
-    save_gray(paths["grid_scale_a"], _grid_to_vis(grid, 7, debug_size))    # a offset
-    save_gray(paths["grid_scale_b"], _grid_to_vis(grid, 11, debug_size))   # b offset
-    save_gray(paths["grid_offset_L"], _grid_to_vis(grid, 3, debug_size))   # L offset (dup)
-    count_vis = stats["count"] / stats["count"].max().clamp_min(1)
-    count_map = count_vis.mean(dim=2).detach().cpu().numpy().astype(np.float32)
+    
     from PIL import Image as _PILImage
-    count_map_resized = np.array(_PILImage.fromarray((np.clip(count_map, 0, 1) * 255).astype(np.uint8)).resize((debug_size, debug_size), _PILImage.NEAREST)) / 255.0
-    save_gray(paths["grid_cell_count"], count_map_resized)
+    _PILImage.fromarray(diff_heatmap).save(paths["diff_map"])
 
     timings["save_debug"] = time.perf_counter() - t6
 
