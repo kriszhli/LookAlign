@@ -48,6 +48,7 @@ class BilateralTransferConfig:
     affine_regularization: float = 0.05  # pull toward identity
     min_samples_per_cell: int = 4
     max_offset: float = 0.20            # clamp affine offset (OKLab units)
+    max_scale_delta: float = 0.35       # clamp per-channel scale around identity
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -215,14 +216,12 @@ def solve_diagonal_affine(
     stats: Dict[str, Tensor],
     cfg: BilateralTransferConfig,
 ) -> Tensor:
-    """Solve per-cell chrominance (a/b) mean-shift from blurred statistics.
+    """Solve per-cell diagonal affine transfer from blurred local statistics.
 
-    The L channel is NOT corrected here — the global 3D LUT already matches L
-    percentiles to within Δ<0.003, and per-cell L offsets were found to
-    compress the tonal range (lifting shadows, dropping highlights), making
-    the output more washed out than the LUT result.
-
-    a/b channels use per-cell mean-shift (offset = mean_ref − mean_base).
+    All OKLab channels, including L, are corrected here so the low-frequency
+    tone and color structure can converge toward the reference. High-frequency
+    detail still comes from the source because the transfer is estimated on the
+    bilateral grid's smoothed cell statistics rather than per-pixel matches.
 
     Returns (gh, gw, gl, 12) grid of flattened 3×4 diagonal affine matrices.
     """
@@ -232,24 +231,27 @@ def solve_diagonal_affine(
     count = stats["count"].clamp_min(1)
     mu_b = stats["sum_base"] / count.unsqueeze(-1)  # (gh, gw, gl, 3)
     mu_r = stats["sum_ref"] / count.unsqueeze(-1)
+    var_b = (stats["ssq_base"] / count.unsqueeze(-1) - mu_b.square()).clamp_min(1e-6)
+    var_r = (stats["ssq_ref"] / count.unsqueeze(-1) - mu_r.square()).clamp_min(1e-6)
 
-    # Per-cell offset = mean_ref - mean_base, clamped for safety
-    raw_offset = (mu_r - mu_b).clamp(-cfg.max_offset, cfg.max_offset)  # (gh,gw,gl,3)
+    raw_scale = torch.sqrt(var_r / var_b).clamp(
+        1.0 - cfg.max_scale_delta,
+        1.0 + cfg.max_scale_delta,
+    )
+    raw_offset = (mu_r - raw_scale * mu_b).clamp(-cfg.max_offset, cfg.max_offset)
 
-    # Regularize: sparse cells → offset = 0, all cells → gentle pull toward 0
     lam = cfg.affine_regularization
     sparse = (stats["count"] < cfg.min_samples_per_cell).float().unsqueeze(-1)
-    offset = raw_offset * (1.0 - sparse) * (1.0 - lam)  # (gh, gw, gl, 3)
+    scale = 1.0 + (raw_scale - 1.0) * (1.0 - sparse) * (1.0 - lam)
+    offset = raw_offset * (1.0 - sparse) * (1.0 - lam)
 
-    # Pack into 3×4 diagonal affine (scale=1 for all channels, L offset=0)
-    # Row-major flat: row0=[0,1,2,3], row1=[4,5,6,7], row2=[8,9,10,11]
     grid = torch.zeros(gh, gw, gl, 12, device=device, dtype=dtype)
-    grid[..., 0] = 1.0               # A[0,0] = L scale
-    # grid[..., 3] = 0  (L offset stays zero — LUT already handles L)
-    grid[..., 5] = 1.0               # A[1,1] = a scale
-    grid[..., 7] = offset[..., 1]    # A[1,3] = a offset
-    grid[..., 10] = 1.0              # A[2,2] = b scale
-    grid[..., 11] = offset[..., 2]   # A[2,3] = b offset
+    grid[..., 0] = scale[..., 0]
+    grid[..., 3] = offset[..., 0]
+    grid[..., 5] = scale[..., 1]
+    grid[..., 7] = offset[..., 1]
+    grid[..., 10] = scale[..., 2]
+    grid[..., 11] = offset[..., 2]
     return grid
 
 
