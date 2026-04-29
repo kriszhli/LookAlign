@@ -28,8 +28,8 @@ else:
 
 Tensor = torch.Tensor
 ROOT = Path(__file__).resolve().parents[1]
-GLOBAL_STAGE_VERSION = "v0.4.3-global-neural-preset-dncm"
-PIPELINE_VERSION = "v0.4.3-neural-preset-bilateral-lab"
+GLOBAL_STAGE_VERSION = "v0.4.4-global-neural-preset-dncm"
+PIPELINE_VERSION = "v0.4.4-neural-preset-bilateral-lab"
 DEFAULT_NEURAL_PRESET_CKPT = "ckpts/neural_preset/best.ckpt"
 NEURAL_PRESET_CKPT_SOURCE = "https://drive.google.com/open?id=1TZRVwIlzBBewwzgjrScrVzeynhBSLmm0&usp=drive_fs"
 

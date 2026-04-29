@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Gradio UI for LookAlign V0.4.3."""
+"""Local Gradio UI for LookAlign V0.4.4."""
 
 from __future__ import annotations
 
@@ -145,7 +145,7 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
     return (
         paths["base_intermediate"],
         paths["final_output"],
-        paths.get("reference_resized", ""),
+        paths.get("edit_map", ""),
         paths.get("diff_map", ""),
     )
 
@@ -155,8 +155,8 @@ css = """
 """
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="LookAlign V0.4.3") as demo:
-        gr.Markdown("# LookAlign V0.4.3 — Neural Preset + Bilateral Transfer")
+    with gr.Blocks(title="LookAlign V0.4.4") as demo:
+        gr.Markdown("# LookAlign V0.4.4 — Neural Preset + Bilateral Transfer")
 
         gr.Markdown("### Examples")
         examples_gallery = ExamplesGallery()
@@ -171,16 +171,16 @@ def build_app() -> gr.Blocks:
             outputs=[source_image, reference_image]
         )
 
-        run_v040_btn = gr.Button("Run V0.4.3", variant="primary")
+        run_v040_btn = gr.Button("Run V0.4.4", variant="primary")
 
         gr.Markdown("## Outputs")
         with gr.Row():
             v4_base = gr.Image(label="Base intermediate (after Neural Preset)", type="filepath")
-            v4_final = gr.Image(label="V0.4.3 Final output", type="filepath")
+            v4_final = gr.Image(label="V0.4.4 Final output", type="filepath")
 
         gr.Markdown("## Alignment and Difference")
         with gr.Row():
-            v4_ref = gr.Image(label="Reference resized", type="filepath")
+            v4_ref = gr.Image(label="Bilateral Transfer Edit Map", type="filepath")
             v4_diff = gr.Image(label="Difference Map (Output vs Aligned Reference)", type="filepath")
 
         run_v040_btn.click(

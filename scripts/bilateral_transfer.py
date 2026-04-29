@@ -27,7 +27,7 @@ from scripts.global_matching import (
     to_hwc_np,
 )
 
-PIPELINE_VERSION = "v0.4.0-bilateral-grid-affine"
+PIPELINE_VERSION = "v0.4.4-edge-aware-bilateral-affine"
 
 
 # ---------------------------------------------------------------------------
@@ -39,16 +39,18 @@ class BilateralTransferConfig:
     fit_long_edge: int = 512
     spatial_bins: int = 32          # grid cells along the long edge
     luma_bins: int = 32             # luminance bins
-    ref_denoise_sigma: float = 1.0  # Gaussian blur σ on reference before splatting;
+    ref_denoise_sigma: float = 0.5  # Gaussian blur σ on reference before splatting;
                                     # suppresses film grain that biases cell means
-    stats_blur_sigma_xy: float = 1.0
-    stats_blur_sigma_l: float = 0.8
     affine_regularization: float = 0.05  # pull toward identity
-    min_samples_per_cell: int = 4
+    min_samples_per_cell: int = 2
     max_offset: float = 24.0            # clamp affine offset (Lab a*/b* units)
-    max_luma_offset: float = 12.0       # tighter clamp for Lab L* offsets
+    max_luma_offset: float = 16.0       # slightly looser clamp for Lab L* offsets
     max_scale_delta: float = 0.35       # clamp per-channel scale around identity
-    max_luma_scale_delta: float = 0.15  # tighter clamp for Lab L* scale
+    max_luma_scale_delta: float = 0.22  # slightly looser clamp for Lab L* scale
+    coeff_smooth_iterations: int = 2
+    coeff_smooth_spatial_sigma: float = 0.06
+    coeff_smooth_luma_sigma: float = 0.05
+    coeff_smooth_confidence_power: float = 1.5
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -107,51 +109,7 @@ def _grid_dims(h: int, w: int, spatial_bins: int) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# 1-D separable Gaussian helpers
-# ---------------------------------------------------------------------------
-
-def _gauss_kernel_1d(sigma: float, max_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-    if sigma < 0.1:
-        return torch.ones(1, device=device, dtype=dtype)
-    ks = min(max(3, int(sigma * 4) | 1), max_size)
-    if ks % 2 == 0:
-        ks += 1
-    x = torch.arange(ks, device=device, dtype=dtype) - ks // 2
-    k = torch.exp(-0.5 * (x / max(sigma, 1e-6)) ** 2)
-    return k / k.sum()
-
-
-def _blur_dim(grid: Tensor, dim: int, sigma: float) -> Tensor:
-    """Gaussian blur along one dimension of an arbitrary-rank tensor."""
-    if sigma < 0.1:
-        return grid
-    size = grid.shape[dim]
-    k = _gauss_kernel_1d(sigma, size, grid.device, grid.dtype)
-    pad_n = len(k) // 2
-    # Move target dim to last, flatten everything else into batch
-    perm = list(range(grid.ndim))
-    perm.append(perm.pop(dim))
-    g = grid.permute(*perm)
-    shape_rest = g.shape[:-1]
-    g = g.reshape(-1, 1, size)
-    g = F.pad(g, (pad_n, pad_n), mode="replicate")
-    g = F.conv1d(g, k.view(1, 1, -1))
-    g = g.reshape(*shape_rest, size)
-    inv = list(range(grid.ndim))
-    inv.insert(dim, inv.pop(-1))
-    return g.permute(*inv)
-
-
-def _blur_grid(grid: Tensor, sigma_xy: float, sigma_l: float) -> Tensor:
-    """Separable 3-D blur on grid shaped (gh, gw, gl, C)."""
-    g = _blur_dim(grid, 0, sigma_xy)   # height
-    g = _blur_dim(g, 1, sigma_xy)      # width
-    g = _blur_dim(g, 2, sigma_l)       # luminance
-    return g
-
-
-# ---------------------------------------------------------------------------
-# Core: splat → blur → solve → slice
+# Core: splat → solve → edge-aware smooth → slice
 # ---------------------------------------------------------------------------
 
 def _identity_affine(device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -177,16 +135,10 @@ def splat_statistics(
     base_flat = base_lab[0].reshape(3, -1).T  # (N, 3)
     ref_flat = ref_lab[0].reshape(3, -1).T
 
-    # Pixel → grid cell indices (nearest)
+    # Pixel → bilateral grid coordinates (soft trilinear splat)
     yy = torch.arange(H, device=device, dtype=dtype).view(-1, 1).expand(H, W).reshape(-1)
     xx = torch.arange(W, device=device, dtype=dtype).view(1, -1).expand(H, W).reshape(-1)
     luma = (base_flat[:, 0] / 100.0).clamp(0, 1)
-
-    iy = (yy / max(H - 1, 1) * (gh - 1)).round().long().clamp(0, gh - 1)
-    ix = (xx / max(W - 1, 1) * (gw - 1)).round().long().clamp(0, gw - 1)
-    il = (luma * (gl - 1)).round().long().clamp(0, gl - 1)
-
-    cell_idx = iy * (gw * gl) + ix * gl + il  # (N,)
 
     total = gh * gw * gl
     count = torch.zeros(total, device=device, dtype=dtype)
@@ -195,12 +147,41 @@ def splat_statistics(
     ssq_base = torch.zeros(total, 3, device=device, dtype=dtype)
     ssq_ref = torch.zeros(total, 3, device=device, dtype=dtype)
 
-    idx3 = cell_idx.unsqueeze(1).expand(-1, 3)
-    count.scatter_add_(0, cell_idx, torch.ones_like(cell_idx, dtype=dtype))
-    sum_base.scatter_add_(0, idx3, base_flat)
-    sum_ref.scatter_add_(0, idx3, ref_flat)
-    ssq_base.scatter_add_(0, idx3, base_flat ** 2)
-    ssq_ref.scatter_add_(0, idx3, ref_flat ** 2)
+    gy = yy / max(H - 1, 1) * (gh - 1)
+    gx = xx / max(W - 1, 1) * (gw - 1)
+    gz = luma * (gl - 1)
+
+    iy0 = gy.floor().long().clamp(0, gh - 1)
+    ix0 = gx.floor().long().clamp(0, gw - 1)
+    il0 = gz.floor().long().clamp(0, gl - 1)
+    iy1 = (iy0 + 1).clamp(0, gh - 1)
+    ix1 = (ix0 + 1).clamp(0, gw - 1)
+    il1 = (il0 + 1).clamp(0, gl - 1)
+
+    fy = (gy - iy0.to(dtype)).clamp(0, 1)
+    fx = (gx - ix0.to(dtype)).clamp(0, 1)
+    fl = (gz - il0.to(dtype)).clamp(0, 1)
+
+    weights = (
+        ((iy0, ix0, il0), (1 - fy) * (1 - fx) * (1 - fl)),
+        ((iy0, ix0, il1), (1 - fy) * (1 - fx) * fl),
+        ((iy0, ix1, il0), (1 - fy) * fx * (1 - fl)),
+        ((iy0, ix1, il1), (1 - fy) * fx * fl),
+        ((iy1, ix0, il0), fy * (1 - fx) * (1 - fl)),
+        ((iy1, ix0, il1), fy * (1 - fx) * fl),
+        ((iy1, ix1, il0), fy * fx * (1 - fl)),
+        ((iy1, ix1, il1), fy * fx * fl),
+    )
+
+    for (iy, ix, il), w in weights:
+        cell_idx = iy * (gw * gl) + ix * gl + il
+        idx3 = cell_idx.unsqueeze(1).expand(-1, 3)
+        count.scatter_add_(0, cell_idx, w)
+        w3 = w.unsqueeze(1)
+        sum_base.scatter_add_(0, idx3, base_flat * w3)
+        sum_ref.scatter_add_(0, idx3, ref_flat * w3)
+        ssq_base.scatter_add_(0, idx3, base_flat.square() * w3)
+        ssq_ref.scatter_add_(0, idx3, ref_flat.square() * w3)
 
     reshape = lambda t: t.reshape(gh, gw, gl) if t.ndim == 1 else t.reshape(gh, gw, gl, 3)
     return {
@@ -216,12 +197,12 @@ def solve_diagonal_affine(
     stats: Dict[str, Tensor],
     cfg: BilateralTransferConfig,
 ) -> Tensor:
-    """Solve per-cell diagonal affine transfer from blurred local statistics.
+    """Solve per-cell diagonal affine transfer from local statistics.
 
     All Lab channels, including L*, are corrected here so the low-frequency
     tone and color structure can converge toward the reference. High-frequency
-    detail still comes from the source because the transfer is estimated on the
-    bilateral grid's smoothed cell statistics rather than per-pixel matches.
+    detail still comes from the source because the transfer is estimated on
+    local cell statistics rather than per-pixel matches.
 
     Returns (gh, gw, gl, 12) grid of flattened 3×4 diagonal affine matrices.
     """
@@ -260,9 +241,9 @@ def solve_diagonal_affine(
     raw_offset = raw_offset.clamp(offset_min, offset_max)
 
     lam = cfg.affine_regularization
-    sparse = (stats["count"] < cfg.min_samples_per_cell).float().unsqueeze(-1)
-    scale = 1.0 + (raw_scale - 1.0) * (1.0 - sparse) * (1.0 - lam)
-    offset = raw_offset * (1.0 - sparse) * (1.0 - lam)
+    confidence = (stats["count"] / max(float(cfg.min_samples_per_cell), 1.0)).clamp(0.0, 1.0).unsqueeze(-1)
+    scale = 1.0 + (raw_scale - 1.0) * confidence * (1.0 - lam)
+    offset = raw_offset * confidence * (1.0 - lam)
 
     grid = torch.zeros(gh, gw, gl, 12, device=device, dtype=dtype)
     grid[..., 0] = scale[..., 0]
@@ -272,6 +253,76 @@ def solve_diagonal_affine(
     grid[..., 10] = scale[..., 2]
     grid[..., 11] = offset[..., 2]
     return grid
+
+
+def _grid_cell_guidance(base_lab: Tensor, gh: int, gw: int, gl: int) -> Tensor:
+    """Per-cell mean guide luminance in normalized bilateral space."""
+    device, dtype = base_lab.device, base_lab.dtype
+
+    guide = (base_lab[0, 0] / 100.0).clamp(0, 1)
+    low = F.interpolate(
+        guide.unsqueeze(0).unsqueeze(0),
+        size=(gh, gw),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0]
+    l_centers = torch.linspace(0.0, 1.0, steps=gl, device=device, dtype=dtype)
+    return low.unsqueeze(-1).expand(gh, gw, gl) - l_centers.view(1, 1, gl)
+
+
+def smooth_affine_grid(
+    grid: Tensor,
+    count: Tensor,
+    guide_delta: Tensor,
+    cfg: BilateralTransferConfig,
+) -> Tensor:
+    """Diffuse affine coefficients across low-barrier neighbors only."""
+    if cfg.coeff_smooth_iterations <= 0:
+        return grid
+
+    confidence = (count / max(float(cfg.min_samples_per_cell), 1.0)).clamp(0.0, 1.0)
+    confidence = confidence.pow(cfg.coeff_smooth_confidence_power).unsqueeze(-1)
+    out = grid.clone()
+
+    spatial_sigma = max(cfg.coeff_smooth_spatial_sigma, 1e-6)
+    luma_sigma = max(cfg.coeff_smooth_luma_sigma, 1e-6)
+
+    neighbor_specs = (
+        (0, 1, spatial_sigma),
+        (1, 1, spatial_sigma),
+        (2, 1, luma_sigma),
+    )
+
+    for _ in range(cfg.coeff_smooth_iterations):
+        numer = confidence * out
+        denom = confidence.clone()
+
+        for dim, direction, sigma in neighbor_specs:
+            src = [slice(None)] * 4
+            dst = [slice(None)] * 4
+            src[dim] = slice(0, -direction)
+            dst[dim] = slice(direction, None)
+
+            delta = guide_delta[tuple(dst[:3])] - guide_delta[tuple(src[:3])]
+            weight = torch.exp(-0.5 * (delta / sigma).square()).unsqueeze(-1)
+
+            src_count = confidence[tuple(src)]
+            dst_count = confidence[tuple(dst)]
+            src_vals = out[tuple(src)]
+            dst_vals = out[tuple(dst)]
+
+            w_src_to_dst = weight * src_count
+            w_dst_to_src = weight * dst_count
+
+            numer[tuple(dst)] += w_src_to_dst * src_vals
+            denom[tuple(dst)] += w_src_to_dst
+            numer[tuple(src)] += w_dst_to_src * dst_vals
+            denom[tuple(src)] += w_dst_to_src
+
+        smoothed = numer / denom.clamp_min(1e-6)
+        out = confidence * out + (1.0 - confidence) * smoothed
+
+    return out
 
 
 def bilateral_slice(
@@ -444,20 +495,16 @@ def run_bilateral_transfer(
     stats = splat_statistics(base_low, ref_low, gh, gw, gl)
     timings["splat"] = time.perf_counter() - t1
 
-    # ---- Stage 2c: blur statistics ----
+    # ---- Stage 2c: solve per-cell affine from raw local statistics ----
     t2 = time.perf_counter()
-    for key in ("count", "sum_base", "sum_ref", "ssq_base", "ssq_ref"):
-        s = stats[key]
-        if s.ndim == 3:
-            s = s.unsqueeze(-1)
-        s = _blur_grid(s, cfg.stats_blur_sigma_xy, cfg.stats_blur_sigma_l)
-        stats[key] = s.squeeze(-1) if key == "count" else s
-    timings["blur_stats"] = time.perf_counter() - t2
-
-    # ---- Stage 2d: solve per-cell affine ----
-    t3 = time.perf_counter()
     grid = solve_diagonal_affine(stats, cfg)
-    timings["solve_affine"] = time.perf_counter() - t3
+    timings["solve_affine"] = time.perf_counter() - t2
+
+    # ---- Stage 2d: confidence-weighted edge-aware coefficient smoothing ----
+    t3 = time.perf_counter()
+    guide_delta = _grid_cell_guidance(base_low, gh, gw, gl)
+    grid = smooth_affine_grid(grid, stats["count"], guide_delta, cfg)
+    timings["smooth_affine"] = time.perf_counter() - t3
 
     # ---- Stage 3: bilateral slice at full resolution ----
     t4 = time.perf_counter()
@@ -527,11 +574,33 @@ def run_bilateral_transfer(
         axis=-1,
     ).astype(np.uint8)
 
+    # Bilateral transfer edit map: visualize how strongly the local stage
+    # changed tone/chroma relative to the base intermediate.
+    base_chroma = base_intermediate_lab[:, 1:3].norm(dim=1)
+    edit_delta_l = ((output_lab[:, 0] - base_intermediate_lab[:, 0]) / 100.0).squeeze(0).detach().cpu().numpy()
+    edit_delta_c = ((out_chroma - base_chroma) / 100.0).squeeze(0).detach().cpu().numpy()
+    edit_signed = np.clip(0.75 * edit_delta_l + 0.25 * edit_delta_c, -1.0, 1.0)
+    edit_strength = np.clip((0.75 * np.abs(edit_delta_l) + 0.25 * np.abs(edit_delta_c)) * 6.0, 0.0, 1.0)
+
+    neutral = 128.0
+    edit_red = neutral + 127.0 * np.clip(edit_signed, 0.0, 1.0) * edit_strength
+    edit_blue = neutral + 127.0 * np.clip(-edit_signed, 0.0, 1.0) * edit_strength
+    edit_green = neutral - 88.0 * edit_strength
+    edit_heatmap = np.stack(
+        [
+            np.clip(edit_red, 0, 255),
+            np.clip(edit_green, 0, 255),
+            np.clip(edit_blue, 0, 255),
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+
     # ---- Save outputs and debug images ----
     t6 = time.perf_counter()
     paths = dict(global_metrics.get("paths", {}))
     paths.update({
         "final_output": str(output_dir / "final_output.png"),
+        "edit_map": str(output_dir / "edit_map.png"),
         "diff_map": str(output_dir / "diff_map.png"),
         "metrics": str(output_dir / "metrics.json"),
     })
@@ -539,6 +608,7 @@ def run_bilateral_transfer(
     save_rgb(paths["final_output"], to_hwc_np(output_rgb))
     
     from PIL import Image as _PILImage
+    _PILImage.fromarray(edit_heatmap).save(paths["edit_map"])
     _PILImage.fromarray(diff_heatmap).save(paths["diff_map"])
 
     timings["save_debug"] = time.perf_counter() - t6
