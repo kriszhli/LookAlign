@@ -8,7 +8,8 @@ Designed for near real-time performance, LookAlign is built for modern image and
 
 ## Versions
 
-- `V0.4.0` - Replaced low-frequency proxy deltas with **bilateral-grid local affine** transfer. Edge-awareness built into the grid structure (luminance-binned cells); misalignment tolerance via statistics-based cell fitting. Eliminates `LightGlue` dependency, reduces hyperparameters from 30+ to 8, runs in ~0.3s on MPS.
+- `V0.4.1` - Reference denoising before bilateral grid splatting. AI-generated film-style references contain grain noise that biases per-cell means (especially lifting shadows). A configurable Gaussian blur (`ref_denoise_sigma=1.0`) suppresses grain while preserving broad color patterns.
+- `V0.4.0` - Replaced low-frequency proxy deltas with **bilateral-grid local affine** transfer. Edge-awareness built into the grid structure (luminance-binned cells); misalignment tolerance via statistics-based cell fitting. Mean-shift-only per cell + global Reinhard std-match. Eliminates `LightGlue` dependency, reduces hyperparameters to 9, runs in ~0.3s on MPS.
 - `V0.3.6` - Switched to linear-RGB 3D LUT global fit; `LightGlue`+`ALIKED`-first local alignment with warped reference and dense OKLab diffuse corrections + confidence.
 - `V0.3.5` - Global `OT`/`SVD` base with `LightGlue`+`ALIKED`-guided sparse sampling into smooth `MPS` local OKLab correction maps + confidence and fallback.
 - `V0.3.1` - Replaced global LUT/`BGrid` with sliced partial `OT` -> `SVD`-smoothed LUT, producing a conservative base intermediate.

@@ -41,6 +41,8 @@ class BilateralTransferConfig:
     fit_long_edge: int = 512
     spatial_bins: int = 32          # grid cells along the long edge
     luma_bins: int = 16             # luminance bins
+    ref_denoise_sigma: float = 1.0  # Gaussian blur σ on reference before splatting;
+                                    # suppresses film grain that biases cell means
     stats_blur_sigma_xy: float = 1.0
     stats_blur_sigma_l: float = 0.8
     affine_regularization: float = 0.05  # pull toward identity
@@ -67,6 +69,29 @@ def _resize_long_edge(img: Tensor, long_edge: int, clamp_01: bool = True) -> Ten
 
 def _resize_to_hw(img: Tensor, h: int, w: int) -> Tensor:
     return F.interpolate(img, size=(int(h), int(w)), mode="bicubic", align_corners=False)
+
+
+def _spatial_gaussian_blur(img: Tensor, sigma: float) -> Tensor:
+    """Per-channel 2-D Gaussian blur on (1, C, H, W) tensor."""
+    if sigma < 0.1:
+        return img
+    ks = max(3, int(sigma * 4) | 1)
+    pad = ks // 2
+    x = torch.arange(ks, device=img.device, dtype=img.dtype) - pad
+    k1d = torch.exp(-0.5 * (x / sigma) ** 2)
+    k1d = k1d / k1d.sum()
+    # Separable: blur H then W
+    kh = k1d.view(1, 1, -1, 1)
+    kw = k1d.view(1, 1, 1, -1)
+    channels = []
+    for c in range(img.shape[1]):
+        ch = img[:, c:c+1]
+        ch = F.pad(ch, (0, 0, pad, pad), "replicate")
+        ch = F.conv2d(ch, kh)
+        ch = F.pad(ch, (pad, pad, 0, 0), "replicate")
+        ch = F.conv2d(ch, kw)
+        channels.append(ch)
+    return torch.cat(channels, dim=1)
 
 
 def _grid_dims(h: int, w: int, spatial_bins: int) -> tuple[int, int]:
@@ -371,6 +396,16 @@ def run_bilateral_transfer(
     _, _, lh, lw = base_low.shape
     ref_low = _resize_to_hw(ref_low, lh, lw)
     timings["downsample"] = time.perf_counter() - t0
+
+    # ---- Stage 2a+: denoise reference before splatting ----
+    # AI-generated film-style references contain grain noise that biases
+    # per-cell means (especially lifting shadows).  A light spatial Gaussian
+    # blur suppresses grain while preserving the broad color patterns that
+    # cell-level statistics are meant to capture.
+    t_dn = time.perf_counter()
+    if cfg.ref_denoise_sigma > 0.1:
+        ref_low = _spatial_gaussian_blur(ref_low, cfg.ref_denoise_sigma)
+    timings["ref_denoise"] = time.perf_counter() - t_dn
 
     # ---- Stage 2b: splat statistics into bilateral grid ----
     t1 = time.perf_counter()
