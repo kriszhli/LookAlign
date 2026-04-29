@@ -215,11 +215,14 @@ def solve_diagonal_affine(
     stats: Dict[str, Tensor],
     cfg: BilateralTransferConfig,
 ) -> Tensor:
-    """Solve per-channel mean-shift from blurred statistics.
+    """Solve per-cell chrominance (a/b) mean-shift from blurred statistics.
 
-    All channels use mean-shift only (scale=1) in the bilateral grid.
-    Intra-cell variance is too small and noisy for reliable std-matching;
-    the global Reinhard std-match is applied as a separate post-step.
+    The L channel is NOT corrected here — the global 3D LUT already matches L
+    percentiles to within Δ<0.003, and per-cell L offsets were found to
+    compress the tonal range (lifting shadows, dropping highlights), making
+    the output more washed out than the LUT result.
+
+    a/b channels use per-cell mean-shift (offset = mean_ref − mean_base).
 
     Returns (gh, gw, gl, 12) grid of flattened 3×4 diagonal affine matrices.
     """
@@ -238,11 +241,11 @@ def solve_diagonal_affine(
     sparse = (stats["count"] < cfg.min_samples_per_cell).float().unsqueeze(-1)
     offset = raw_offset * (1.0 - sparse) * (1.0 - lam)  # (gh, gw, gl, 3)
 
-    # Pack into 3×4 diagonal affine (scale=1 for all channels)
+    # Pack into 3×4 diagonal affine (scale=1 for all channels, L offset=0)
     # Row-major flat: row0=[0,1,2,3], row1=[4,5,6,7], row2=[8,9,10,11]
     grid = torch.zeros(gh, gw, gl, 12, device=device, dtype=dtype)
     grid[..., 0] = 1.0               # A[0,0] = L scale
-    grid[..., 3] = offset[..., 0]    # A[0,3] = L offset
+    # grid[..., 3] = 0  (L offset stays zero — LUT already handles L)
     grid[..., 5] = 1.0               # A[1,1] = a scale
     grid[..., 7] = offset[..., 1]    # A[1,3] = a offset
     grid[..., 10] = 1.0              # A[2,2] = b scale
@@ -434,25 +437,7 @@ def run_bilateral_transfer(
     output_lab = bilateral_slice(source_lab, base_intermediate_lab, grid)
     timings["bilateral_slice"] = time.perf_counter() - t4
 
-    # ---- Stage 3b: global Reinhard std-match for all channels ----
-    # The bilateral grid captures spatially-varying mean-shifts per cell.
-    # Intra-cell variance is too small for reliable per-cell std-matching,
-    # so we apply a single global std correction per channel (Reinhard) to
-    # match the reference distribution width.
-    t_lc = time.perf_counter()
-    for c in range(3):
-        out_c = output_lab[:, c:c+1]
-        ref_c = reference_resized_lab[:, c:c+1]
-        out_mean = out_c.mean()
-        out_std = out_c.std().clamp_min(1e-6)
-        ref_std = ref_c.std().clamp_min(1e-6)
-        corrected = (out_c - out_mean) * (ref_std / out_std) + out_mean
-        if c == 0:  # L channel: clamp to valid range
-            corrected = corrected.clamp(0, 1)
-        output_lab = torch.cat([
-            output_lab[:, :c], corrected, output_lab[:, c+1:]
-        ], dim=1)
-    timings["global_std_correction"] = time.perf_counter() - t_lc
+
 
     # ---- Optional guided-filter post-pass ----
     t5 = time.perf_counter()
