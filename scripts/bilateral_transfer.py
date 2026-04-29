@@ -105,30 +105,6 @@ def _grid_dims(h: int, w: int, spatial_bins: int) -> tuple[int, int]:
     return gh, gw
 
 
-def _align_optical_flow(ref_img: Tensor, base_img: Tensor) -> Tensor:
-    """Warp ref_img to align with base_img using DIS Optical Flow on L/gray channel.
-    Input/output tensors are (1, C, H, W)."""
-    import cv2
-    import numpy as np
-    
-    # Use the first channel (assumed L or R) as grayscale approximation for flow
-    ref_gray = (ref_img[0, 0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    base_gray = (base_img[0, 0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-
-    inst = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-    flow = inst.calc(ref_gray, base_gray, None)
-
-    h, w = base_gray.shape
-    map_x = np.tile(np.arange(w), (h, 1)).astype(np.float32) + flow[..., 0]
-    map_y = np.repeat(np.arange(h), w).reshape(h, w).astype(np.float32) + flow[..., 1]
-
-    ref_np = ref_img[0].permute(1, 2, 0).detach().cpu().numpy()
-    warped_np = cv2.remap(ref_np, map_x, map_y, cv2.INTER_LINEAR)
-    
-    warped_t = torch.from_numpy(warped_np).permute(2, 0, 1).unsqueeze(0)
-    return warped_t.to(ref_img.device)
-
-
 # ---------------------------------------------------------------------------
 # 1-D separable Gaussian helpers
 # ---------------------------------------------------------------------------
@@ -424,15 +400,15 @@ def run_bilateral_transfer(
     ref_low = _resize_to_hw(ref_low, lh, lw)
     timings["downsample"] = time.perf_counter() - t0
 
-    # ---- Stage 2a+: denoise and align reference before splatting ----
-    # 1. Align the reference structurally to the source to ensure local
-    #    color features fall into the correct spatial bins.
-    # 2. Blur to suppress grain noise that biases per-cell means.
+    # ---- Stage 2a+: denoise reference before splatting ----
+    # AI-generated film-style references contain grain noise that biases
+    # per-cell means (especially lifting shadows).  A light spatial Gaussian
+    # blur suppresses grain while preserving the broad color patterns that
+    # cell-level statistics are meant to capture.
     t_dn = time.perf_counter()
-    ref_low = _align_optical_flow(ref_low, base_low)
     if cfg.ref_denoise_sigma > 0.1:
         ref_low = _spatial_gaussian_blur(ref_low, cfg.ref_denoise_sigma)
-    timings["ref_denoise_and_align"] = time.perf_counter() - t_dn
+    timings["ref_denoise"] = time.perf_counter() - t_dn
 
     # ---- Stage 2b: splat statistics into bilateral grid ----
     t1 = time.perf_counter()
@@ -476,32 +452,32 @@ def run_bilateral_transfer(
 
     output_rgb = soft_gamut_compress(oklab_to_rgb(output_lab))
 
-    # Compute aligned difference map for UI
-    ref_rgb = global_metrics["tensors"]["reference_resized_rgb"]
-    # Align reference RGB to output RGB so differences show pure color shifts, not structural edges
-    ref_rgb_aligned = _align_optical_flow(ref_rgb, output_rgb)
-    diff_map = (output_rgb - ref_rgb_aligned).abs().mean(dim=1).squeeze(0).detach().cpu().numpy()
-    
-    # False-color heat mapping (blue=low diff, red=high diff)
-    import cv2
-    diff_norm = (np.clip(diff_map * 2.5, 0, 1) * 255).astype(np.uint8)
-    diff_heatmap = cv2.applyColorMap(diff_norm, cv2.COLORMAP_INFERNO)
-    diff_heatmap = cv2.cvtColor(diff_heatmap, cv2.COLOR_BGR2RGB)
-
     # ---- Save outputs and debug images ----
     t6 = time.perf_counter()
     paths = dict(global_metrics.get("paths", {}))
     paths.update({
         "final_output": str(output_dir / "final_output.png"),
-        "diff_map": str(output_dir / "diff_map.png"),
+        "grid_scale_L": str(output_dir / "grid_scale_L.png"),
+        "grid_scale_a": str(output_dir / "grid_scale_a.png"),
+        "grid_scale_b": str(output_dir / "grid_scale_b.png"),
+        "grid_offset_L": str(output_dir / "grid_offset_L.png"),
+        "grid_cell_count": str(output_dir / "grid_cell_count.png"),
         "metrics": str(output_dir / "metrics.json"),
     })
 
     save_rgb(paths["final_output"], to_hwc_np(output_rgb))
-    
-    # Save the difference map
+    # Upscale grid debug images to viewable size (grids are only ~16×12 px)
+    debug_size = 256
+    # Scales are all 1.0 now (mean-shift only), so visualize offsets
+    save_gray(paths["grid_scale_L"], _grid_to_vis(grid, 3, debug_size))    # L offset
+    save_gray(paths["grid_scale_a"], _grid_to_vis(grid, 7, debug_size))    # a offset
+    save_gray(paths["grid_scale_b"], _grid_to_vis(grid, 11, debug_size))   # b offset
+    save_gray(paths["grid_offset_L"], _grid_to_vis(grid, 3, debug_size))   # L offset (dup)
+    count_vis = stats["count"] / stats["count"].max().clamp_min(1)
+    count_map = count_vis.mean(dim=2).detach().cpu().numpy().astype(np.float32)
     from PIL import Image as _PILImage
-    _PILImage.fromarray(diff_heatmap).save(paths["diff_map"])
+    count_map_resized = np.array(_PILImage.fromarray((np.clip(count_map, 0, 1) * 255).astype(np.uint8)).resize((debug_size, debug_size), _PILImage.NEAREST)) / 255.0
+    save_gray(paths["grid_cell_count"], count_map_resized)
 
     timings["save_debug"] = time.perf_counter() - t6
 

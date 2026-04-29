@@ -180,7 +180,9 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
         paths["base_intermediate"],
         paths["final_output"],
         paths.get("reference_resized", ""),
-        paths.get("diff_map", ""),
+        paths["grid_scale_L"],
+        paths["grid_offset_L"],
+        paths["grid_cell_count"],
     )
 
 
@@ -214,15 +216,17 @@ def build_app() -> gr.Blocks:
                 v4_base = gr.Image(label="Base intermediate (after 3D LUT)", type="filepath")
                 v4_final = gr.Image(label="V0.4 Final output", type="filepath")
 
-            gr.Markdown("## Alignment and Difference")
+            gr.Markdown("## Bilateral Grid Debug")
             with gr.Row():
                 v4_ref = gr.Image(label="Reference resized", type="filepath")
-                v4_diff = gr.Image(label="Difference Map (Output vs Aligned Reference)", type="filepath")
+                v4_scale_L = gr.Image(label="Grid scale L (luma)", type="filepath")
+                v4_offset_L = gr.Image(label="Grid offset L", type="filepath")
+                v4_cell_count = gr.Image(label="Grid cell count", type="filepath")
 
             run_v040_btn.click(
                 fn=run_v040,
                 inputs=[source_image, reference_image],
-                outputs=[v4_base, v4_final, v4_ref, v4_diff],
+                outputs=[v4_base, v4_final, v4_ref, v4_scale_L, v4_offset_L, v4_cell_count],
                 queue=True,
             )
 
