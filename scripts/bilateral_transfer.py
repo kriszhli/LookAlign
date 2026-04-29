@@ -598,8 +598,8 @@ def run_bilateral_transfer(
     edit_delta_c = ((out_chroma - base_chroma) / 100.0).squeeze(0).detach().cpu().numpy()
     edit_strength = np.clip((0.75 * np.abs(edit_delta_l) + 0.25 * np.abs(edit_delta_c)) * 6.0, 0.0, 1.0)
     edit_mask = (edit_strength > 0.02).astype(np.float32)[..., None]
-    output_rgb_np = to_hwc_np(output_rgb).astype(np.float32)
-    edit_map = np.clip(output_rgb_np * edit_mask, 0, 255).astype(np.uint8)
+    output_rgb_np = to_hwc_np(output_rgb)
+    edit_map = np.clip(output_rgb_np * edit_mask, 0.0, 1.0).astype(np.float32)
 
     # ---- Save outputs and debug images ----
     t6 = time.perf_counter()
@@ -614,7 +614,7 @@ def run_bilateral_transfer(
     save_rgb(paths["final_output"], to_hwc_np(output_rgb))
     
     from PIL import Image as _PILImage
-    _PILImage.fromarray(edit_map).save(paths["edit_map"])
+    save_rgb(paths["edit_map"], edit_map)
     _PILImage.fromarray(diff_heatmap).save(paths["diff_map"])
 
     timings["save_debug"] = time.perf_counter() - t6
