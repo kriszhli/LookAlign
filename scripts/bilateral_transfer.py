@@ -591,15 +591,16 @@ def run_bilateral_transfer(
         axis=-1,
     ).astype(np.uint8)
 
-    # Bilateral transfer edit map: dark background, with changed pixels
-    # showing their actual transferred RGB values.
+    # Bilateral transfer edit map: dark background, showing the actual RGB
+    # delta introduced by the bilateral stage relative to the base intermediate.
     base_chroma = base_intermediate_lab[:, 1:3].norm(dim=1)
     edit_delta_l = ((output_lab[:, 0] - base_intermediate_lab[:, 0]) / 100.0).squeeze(0).detach().cpu().numpy()
     edit_delta_c = ((out_chroma - base_chroma) / 100.0).squeeze(0).detach().cpu().numpy()
     edit_strength = np.clip((0.75 * np.abs(edit_delta_l) + 0.25 * np.abs(edit_delta_c)) * 6.0, 0.0, 1.0)
     edit_mask = (edit_strength > 0.02).astype(np.float32)[..., None]
     output_rgb_np = to_hwc_np(output_rgb)
-    edit_map = np.clip(output_rgb_np * edit_mask, 0.0, 1.0).astype(np.float32)
+    base_rgb_np = to_hwc_np(base_intermediate_rgb)
+    edit_map = np.clip(np.abs(output_rgb_np - base_rgb_np) * edit_mask, 0.0, 1.0).astype(np.float32)
 
     # ---- Save outputs and debug images ----
     t6 = time.perf_counter()
