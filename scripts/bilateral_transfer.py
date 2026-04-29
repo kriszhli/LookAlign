@@ -48,7 +48,9 @@ class BilateralTransferConfig:
     affine_regularization: float = 0.05  # pull toward identity
     min_samples_per_cell: int = 4
     max_offset: float = 0.20            # clamp affine offset (OKLab units)
+    max_luma_offset: float = 0.10       # tighter clamp for OKLab L offsets
     max_scale_delta: float = 0.35       # clamp per-channel scale around identity
+    max_luma_scale_delta: float = 0.15  # tighter clamp for OKLab L scale
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -234,11 +236,30 @@ def solve_diagonal_affine(
     var_b = (stats["ssq_base"] / count.unsqueeze(-1) - mu_b.square()).clamp_min(1e-6)
     var_r = (stats["ssq_ref"] / count.unsqueeze(-1) - mu_r.square()).clamp_min(1e-6)
 
-    raw_scale = torch.sqrt(var_r / var_b).clamp(
-        1.0 - cfg.max_scale_delta,
-        1.0 + cfg.max_scale_delta,
-    )
-    raw_offset = (mu_r - raw_scale * mu_b).clamp(-cfg.max_offset, cfg.max_offset)
+    raw_scale = torch.sqrt(var_r / var_b)
+    scale_min = torch.tensor(
+        [1.0 - cfg.max_luma_scale_delta, 1.0 - cfg.max_scale_delta, 1.0 - cfg.max_scale_delta],
+        device=device,
+        dtype=dtype,
+    ).view(1, 1, 1, 3)
+    scale_max = torch.tensor(
+        [1.0 + cfg.max_luma_scale_delta, 1.0 + cfg.max_scale_delta, 1.0 + cfg.max_scale_delta],
+        device=device,
+        dtype=dtype,
+    ).view(1, 1, 1, 3)
+    raw_scale = raw_scale.clamp(scale_min, scale_max)
+    raw_offset = mu_r - raw_scale * mu_b
+    offset_min = torch.tensor(
+        [-cfg.max_luma_offset, -cfg.max_offset, -cfg.max_offset],
+        device=device,
+        dtype=dtype,
+    ).view(1, 1, 1, 3)
+    offset_max = torch.tensor(
+        [cfg.max_luma_offset, cfg.max_offset, cfg.max_offset],
+        device=device,
+        dtype=dtype,
+    ).view(1, 1, 1, 3)
+    raw_offset = raw_offset.clamp(offset_min, offset_max)
 
     lam = cfg.affine_regularization
     sparse = (stats["count"] < cfg.min_samples_per_cell).float().unsqueeze(-1)
@@ -323,6 +344,12 @@ def bilateral_slice(
     bi_aug = torch.cat([bi, ones], dim=-1)  # (H, W, 4)
     out = torch.einsum("hwij,hwj->hwi", A, bi_aug)  # (H, W, 3)
     return out.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+
+
+def _clamp_oklab_l(lab: Tensor) -> Tensor:
+    out = lab.clone()
+    out[:, 0:1] = out[:, 0:1].clamp(0.0, 1.0)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +464,7 @@ def run_bilateral_transfer(
     # ---- Stage 3: bilateral slice at full resolution ----
     t4 = time.perf_counter()
     output_lab = bilateral_slice(source_lab, base_intermediate_lab, grid)
+    output_lab = _clamp_oklab_l(output_lab)
     timings["bilateral_slice"] = time.perf_counter() - t4
 
 
@@ -450,6 +478,7 @@ def run_bilateral_transfer(
             cfg.guided_filter_radius,
             cfg.guided_filter_eps,
         )
+        output_lab = _clamp_oklab_l(output_lab)
     timings["guided_filter"] = time.perf_counter() - t5
 
     output_rgb = soft_gamut_compress(oklab_to_rgb(output_lab))
