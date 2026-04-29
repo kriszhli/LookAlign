@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Gradio UI for LookAlign V0.3.6."""
+"""Local Gradio UI for LookAlign V0.4 + V0.3.6 comparison."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import gradio as gr
 
 from scripts.global_matching import GlobalMatchingConfig, run_global_matching
 from scripts.local_matching import LocalMatchingConfig, run_local_diffuse_matching
+from scripts.bilateral_transfer import BilateralTransferConfig, run_bilateral_transfer
 
 
 ROOT = Path(__file__).resolve().parent
@@ -31,13 +32,11 @@ def choose_input(path: Optional[str], default: Path, label: str) -> str:
     raise gr.Error(f"Please upload a {label} image.")
 
 
-def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[str, ...]:
+def run_v036(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[str, ...]:
     source = choose_input(source_path, DEFAULT_SOURCE, "source")
     reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
-    run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "v036"
 
-    # V0.3.6 uses locked global and local matching parameters.
-    # The UI intentionally exposes no tuning sliders while the stages stabilize.
     global_metrics = run_global_matching(source, reference, run_dir, GlobalMatchingConfig())
     tensors = global_metrics["tensors"]
     metrics = run_local_diffuse_matching(
@@ -66,53 +65,107 @@ def run_ui(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[s
     )
 
 
+def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[str, ...]:
+    source = choose_input(source_path, DEFAULT_SOURCE, "source")
+    reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
+    run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "v040"
+
+    global_metrics = run_global_matching(source, reference, run_dir, GlobalMatchingConfig())
+    tensors = global_metrics["tensors"]
+    metrics = run_bilateral_transfer(
+        base_intermediate_lab=tensors["base_intermediate_lab"],
+        base_intermediate_rgb=tensors["base_intermediate_rgb"],
+        reference_resized_lab=tensors["reference_resized_lab"],
+        reference_resized_rgb=tensors["reference_resized_rgb"],
+        source_lab=tensors["source_lab"],
+        source_rgb=tensors["source_rgb"],
+        output_dir=run_dir,
+        global_metrics=global_metrics,
+        config=BilateralTransferConfig(),
+    )
+    paths = metrics["paths"]
+    return (
+        paths["base_intermediate"],
+        paths["final_output"],
+        paths.get("reference_resized", ""),
+        paths["grid_scale_L"],
+        paths["grid_offset_L"],
+        paths["grid_cell_count"],
+    )
+
+
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="LookAlign V0.3.6") as demo:
-        gr.Markdown("# LookAlign V0.3.6")
+    with gr.Blocks(title="LookAlign V0.4") as demo:
+        gr.Markdown("# LookAlign V0.4 — Bilateral Grid Affine Transfer")
 
         with gr.Row():
             source_image = gr.Image(label="Source image", type="filepath", value=existing_path(DEFAULT_SOURCE), interactive=True)
             reference_image = gr.Image(label="Reference image", type="filepath", value=existing_path(DEFAULT_REFERENCE), interactive=True)
 
-        run_button = gr.Button("Run V0.3.6", variant="primary")
+        # ---- V0.4 tab ----
+        with gr.Tab("V0.4 Bilateral Grid"):
+            run_v040_btn = gr.Button("Run V0.4", variant="primary")
 
-        gr.Markdown("## Outputs")
-        with gr.Row():
-            base_intermediate = gr.Image(label="Base intermediate (after 3D LUT)", type="filepath")
-            final_output = gr.Image(label="Final output", type="filepath")
+            gr.Markdown("## Outputs")
+            with gr.Row():
+                v4_base = gr.Image(label="Base intermediate (after 3D LUT)", type="filepath")
+                v4_final = gr.Image(label="V0.4 Final output", type="filepath")
 
-        gr.Markdown("## Reference And Alignment")
-        with gr.Row():
-            reference_resized = gr.Image(label="Reference resized to base geometry", type="filepath")
-            lightglue_matches = gr.Image(label="LightGlue matches", type="filepath")
-            filtered_match_confidence = gr.Image(label="Aligned match confidence", type="filepath")
+            gr.Markdown("## Bilateral Grid Debug")
+            with gr.Row():
+                v4_ref = gr.Image(label="Reference resized", type="filepath")
+                v4_scale_L = gr.Image(label="Grid scale L (luma)", type="filepath")
+                v4_offset_L = gr.Image(label="Grid offset L", type="filepath")
+                v4_cell_count = gr.Image(label="Grid cell count", type="filepath")
 
-        gr.Markdown("## Applied Local Maps")
-        with gr.Row():
-            diffuse_luma_delta = gr.Image(label="Diffuse luma delta", type="filepath")
-            diffuse_hue_delta = gr.Image(label="Diffuse hue delta", type="filepath")
-            diffuse_chroma_scale = gr.Image(label="Diffuse chroma scale", type="filepath")
-        with gr.Row():
-            diffuse_confidence = gr.Image(label="Diffuse confidence", type="filepath")
-            match_density = gr.Image(label="Match density", type="filepath")
+            run_v040_btn.click(
+                fn=run_v040,
+                inputs=[source_image, reference_image],
+                outputs=[v4_base, v4_final, v4_ref, v4_scale_L, v4_offset_L, v4_cell_count],
+                queue=True,
+            )
 
-        run_button.click(
-            fn=run_ui,
-            inputs=[source_image, reference_image],
-            outputs=[
-                base_intermediate,
-                final_output,
-                reference_resized,
-                lightglue_matches,
-                filtered_match_confidence,
-                diffuse_luma_delta,
-                diffuse_hue_delta,
-                diffuse_chroma_scale,
-                diffuse_confidence,
-                match_density,
-            ],
-            queue=True,
-        )
+        # ---- V0.3.6 comparison tab ----
+        with gr.Tab("V0.3.6 (comparison)"):
+            run_v036_btn = gr.Button("Run V0.3.6", variant="secondary")
+
+            gr.Markdown("## Outputs")
+            with gr.Row():
+                base_intermediate = gr.Image(label="Base intermediate (after 3D LUT)", type="filepath")
+                final_output = gr.Image(label="V0.3.6 Final output", type="filepath")
+
+            gr.Markdown("## Reference And Alignment")
+            with gr.Row():
+                reference_resized = gr.Image(label="Reference resized", type="filepath")
+                lightglue_matches = gr.Image(label="LightGlue matches", type="filepath")
+                filtered_match_confidence = gr.Image(label="Aligned match confidence", type="filepath")
+
+            gr.Markdown("## Applied Local Maps")
+            with gr.Row():
+                diffuse_luma_delta = gr.Image(label="Diffuse luma delta", type="filepath")
+                diffuse_hue_delta = gr.Image(label="Diffuse hue delta", type="filepath")
+                diffuse_chroma_scale = gr.Image(label="Diffuse chroma scale", type="filepath")
+            with gr.Row():
+                diffuse_confidence = gr.Image(label="Diffuse confidence", type="filepath")
+                match_density = gr.Image(label="Match density", type="filepath")
+
+            run_v036_btn.click(
+                fn=run_v036,
+                inputs=[source_image, reference_image],
+                outputs=[
+                    base_intermediate,
+                    final_output,
+                    reference_resized,
+                    lightglue_matches,
+                    filtered_match_confidence,
+                    diffuse_luma_delta,
+                    diffuse_hue_delta,
+                    diffuse_chroma_scale,
+                    diffuse_confidence,
+                    match_density,
+                ],
+                queue=True,
+            )
 
     return demo
 
