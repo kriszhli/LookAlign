@@ -38,7 +38,7 @@ PIPELINE_VERSION = "v0.4.0-bilateral-grid-affine"
 class BilateralTransferConfig:
     fit_long_edge: int = 512
     spatial_bins: int = 32          # grid cells along the long edge
-    luma_bins: int = 16             # luminance bins
+    luma_bins: int = 32             # luminance bins
     ref_denoise_sigma: float = 1.0  # Gaussian blur σ on reference before splatting;
                                     # suppresses film grain that biases cell means
     stats_blur_sigma_xy: float = 1.0
@@ -275,21 +275,21 @@ def solve_diagonal_affine(
 
 
 def bilateral_slice(
-    source_lab: Tensor,
     base_int_lab: Tensor,
     grid: Tensor,
 ) -> Tensor:
     """Apply bilateral grid to full-res image.
 
-    Guide = source luminance (for edge preservation).
+    Guide = base-intermediate luminance so the slice follows the actual tone
+    structure being transferred, especially in the highlights.
     Input = base-intermediate (LUT-corrected) colors.
     """
-    _, _, H, W = source_lab.shape
+    _, _, H, W = base_int_lab.shape
     gh, gw, gl, _ = grid.shape
-    device, dtype = source_lab.device, source_lab.dtype
+    device, dtype = base_int_lab.device, base_int_lab.dtype
 
-    # Guide coordinates: source luminance
-    guide_L = (source_lab[0, 0] / 100.0).clamp(0, 1)  # (H, W)
+    # Guide coordinates: base-intermediate luminance
+    guide_L = (base_int_lab[0, 0] / 100.0).clamp(0, 1)  # (H, W)
 
     # Continuous grid coordinates
     gy = torch.arange(H, device=device, dtype=dtype).view(-1, 1) / max(H - 1, 1) * (gh - 1)
@@ -461,7 +461,7 @@ def run_bilateral_transfer(
 
     # ---- Stage 3: bilateral slice at full resolution ----
     t4 = time.perf_counter()
-    output_lab = bilateral_slice(source_lab, base_intermediate_lab, grid)
+    output_lab = bilateral_slice(base_intermediate_lab, grid)
     output_lab = _clamp_lab_l(output_lab)
     timings["bilateral_slice"] = time.perf_counter() - t4
 
