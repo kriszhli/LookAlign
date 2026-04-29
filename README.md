@@ -8,7 +8,6 @@ Designed for near real-time performance, LookAlign is built for modern image and
 
 ## Versions
 
-- `V0.4.3` - Addressed unaligned reference color-washing by using **DIS Optical Flow** to align the reference to the source *before* computing bilateral statistics. Ensures saturated, local color features fall into correct spatial bins. Replaced debug grids in the UI with an aligned difference map heat-viz.
 - `V0.4.2` - Fixed "washed out" issue by restricting the bilateral grid to correct **chrominance (a/b) only**. The global 3D LUT already perfectly matches the L percentiles, and applying per-cell L offsets was compressing the tonal range. Removed the global Reinhard standard deviation matching which was increasing pixel-wise error.
 - `V0.4.1` - Reference denoising before bilateral grid splatting. AI-generated film-style references contain grain noise that biases per-cell means (especially lifting shadows). A configurable Gaussian blur (`ref_denoise_sigma=1.0`) suppresses grain while preserving broad color patterns.
 - `V0.4.0` - Replaced low-frequency proxy deltas with **bilateral-grid local affine** transfer. Edge-awareness built into the grid structure (luminance-binned cells); misalignment tolerance via statistics-based cell fitting. Mean-shift-only per cell + global Reinhard std-match. Eliminates `LightGlue` dependency, reduces hyperparameters to 9, runs in ~0.3s on MPS.
