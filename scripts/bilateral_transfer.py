@@ -21,9 +21,7 @@ import torch.nn.functional as F
 from scripts.global_matching import (
     Tensor,
     image_stats_from_lab,
-    oklab_to_rgb,
-    rgb_to_oklab,
-    save_gray,
+    lab_to_rgb,
     save_rgb,
     soft_gamut_compress,
     to_hwc_np,
@@ -47,10 +45,10 @@ class BilateralTransferConfig:
     stats_blur_sigma_l: float = 0.8
     affine_regularization: float = 0.05  # pull toward identity
     min_samples_per_cell: int = 4
-    max_offset: float = 0.20            # clamp affine offset (OKLab units)
-    max_luma_offset: float = 0.10       # tighter clamp for OKLab L offsets
+    max_offset: float = 24.0            # clamp affine offset (Lab a*/b* units)
+    max_luma_offset: float = 12.0       # tighter clamp for Lab L* offsets
     max_scale_delta: float = 0.35       # clamp per-channel scale around identity
-    max_luma_scale_delta: float = 0.15  # tighter clamp for OKLab L scale
+    max_luma_scale_delta: float = 0.15  # tighter clamp for Lab L* scale
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -182,7 +180,7 @@ def splat_statistics(
     # Pixel → grid cell indices (nearest)
     yy = torch.arange(H, device=device, dtype=dtype).view(-1, 1).expand(H, W).reshape(-1)
     xx = torch.arange(W, device=device, dtype=dtype).view(1, -1).expand(H, W).reshape(-1)
-    luma = base_flat[:, 0].clamp(0, 1)
+    luma = (base_flat[:, 0] / 100.0).clamp(0, 1)
 
     iy = (yy / max(H - 1, 1) * (gh - 1)).round().long().clamp(0, gh - 1)
     ix = (xx / max(W - 1, 1) * (gw - 1)).round().long().clamp(0, gw - 1)
@@ -220,7 +218,7 @@ def solve_diagonal_affine(
 ) -> Tensor:
     """Solve per-cell diagonal affine transfer from blurred local statistics.
 
-    All OKLab channels, including L, are corrected here so the low-frequency
+    All Lab channels, including L*, are corrected here so the low-frequency
     tone and color structure can converge toward the reference. High-frequency
     detail still comes from the source because the transfer is estimated on the
     bilateral grid's smoothed cell statistics rather than per-pixel matches.
@@ -291,7 +289,7 @@ def bilateral_slice(
     device, dtype = source_lab.device, source_lab.dtype
 
     # Guide coordinates: source luminance
-    guide_L = source_lab[0, 0].clamp(0, 1)  # (H, W)
+    guide_L = (source_lab[0, 0] / 100.0).clamp(0, 1)  # (H, W)
 
     # Continuous grid coordinates
     gy = torch.arange(H, device=device, dtype=dtype).view(-1, 1) / max(H - 1, 1) * (gh - 1)
@@ -346,9 +344,9 @@ def bilateral_slice(
     return out.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
 
 
-def _clamp_oklab_l(lab: Tensor) -> Tensor:
+def _clamp_lab_l(lab: Tensor) -> Tensor:
     out = lab.clone()
-    out[:, 0:1] = out[:, 0:1].clamp(0.0, 1.0)
+    out[:, 0:1] = out[:, 0:1].clamp(0.0, 100.0)
     return out
 
 
@@ -421,7 +419,7 @@ def run_bilateral_transfer(
 
     # ---- Stage 2a: downsample to working resolution ----
     t0 = time.perf_counter()
-    # OKLab a/b channels are NOT in [0,1], so do not clamp
+    # CIE Lab channels are not bounded to [0, 1], so do not clamp
     base_low = _resize_long_edge(base_intermediate_lab, cfg.fit_long_edge, clamp_01=False)
     ref_low = _resize_long_edge(reference_resized_lab, cfg.fit_long_edge, clamp_01=False)
     # Ensure same spatial size
@@ -464,7 +462,7 @@ def run_bilateral_transfer(
     # ---- Stage 3: bilateral slice at full resolution ----
     t4 = time.perf_counter()
     output_lab = bilateral_slice(source_lab, base_intermediate_lab, grid)
-    output_lab = _clamp_oklab_l(output_lab)
+    output_lab = _clamp_lab_l(output_lab)
     timings["bilateral_slice"] = time.perf_counter() - t4
 
 
@@ -478,10 +476,10 @@ def run_bilateral_transfer(
             cfg.guided_filter_radius,
             cfg.guided_filter_eps,
         )
-        output_lab = _clamp_oklab_l(output_lab)
+        output_lab = _clamp_lab_l(output_lab)
     timings["guided_filter"] = time.perf_counter() - t5
 
-    output_rgb = soft_gamut_compress(oklab_to_rgb(output_lab))
+    output_rgb = soft_gamut_compress(lab_to_rgb(output_lab))
 
     # Compute aligned difference map for UI visualization ONLY
     ref_rgb = global_metrics["tensors"]["reference_resized_rgb"]

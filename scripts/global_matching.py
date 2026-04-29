@@ -103,40 +103,59 @@ def linear_to_srgb(rgb: Tensor) -> Tensor:
     return torch.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * torch.pow(rgb, 1.0 / 2.4) - 0.055)
 
 
-def rgb_to_oklab(rgb: Tensor) -> Tensor:
+def rgb_to_lab(rgb: Tensor) -> Tensor:
     linear = srgb_to_linear(rgb)
     r, g, b = linear.unbind(dim=1)
-    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
-    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
-    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
-    l_ = torch.sign(l) * torch.abs(l).pow(1.0 / 3.0)
-    m_ = torch.sign(m) * torch.abs(m).pow(1.0 / 3.0)
-    s_ = torch.sign(s) * torch.abs(s).pow(1.0 / 3.0)
-    return torch.stack(
-        (
-            0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
-        ),
-        dim=1,
-    )
+    x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b
+    y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+    z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b
+
+    xn, yn, zn = 0.95047, 1.0, 1.08883
+    delta = 6.0 / 29.0
+    delta3 = delta ** 3
+
+    def f(t: Tensor) -> Tensor:
+        return torch.where(t > delta3, t.pow(1.0 / 3.0), t / (3.0 * delta * delta) + 4.0 / 29.0)
+
+    fx = f(x / xn)
+    fy = f(y / yn)
+    fz = f(z / zn)
+    return torch.stack((116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)), dim=1)
 
 
-def oklab_to_rgb(lab: Tensor) -> Tensor:
+def lab_to_rgb(lab: Tensor) -> Tensor:
     l, a, b = lab.unbind(dim=1)
-    l_ = l + 0.3963377774 * a + 0.2158037573 * b
-    m_ = l - 0.1055613458 * a - 0.0638541728 * b
-    s_ = l - 0.0894841775 * a - 1.2914855480 * b
-    l3, m3, s3 = l_.pow(3.0), m_.pow(3.0), s_.pow(3.0)
+    fy = (l + 16.0) / 116.0
+    fx = fy + a / 500.0
+    fz = fy - b / 200.0
+
+    delta = 6.0 / 29.0
+
+    def finv(t: Tensor) -> Tensor:
+        return torch.where(t > delta, t.pow(3.0), 3.0 * delta * delta * (t - 4.0 / 29.0))
+
+    xn, yn, zn = 0.95047, 1.0, 1.08883
+    x = xn * finv(fx)
+    y = yn * finv(fy)
+    z = zn * finv(fz)
+
     linear = torch.stack(
         (
-            4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
-            -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
-            -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3,
+            3.2404542 * x - 1.5371385 * y - 0.4985314 * z,
+            -0.9692660 * x + 1.8760108 * y + 0.0415560 * z,
+            0.0556434 * x - 0.2040259 * y + 1.0572252 * z,
         ),
         dim=1,
     )
     return linear_to_srgb(linear)
+
+
+def rgb_to_oklab(rgb: Tensor) -> Tensor:
+    return rgb_to_lab(rgb)
+
+
+def oklab_to_rgb(lab: Tensor) -> Tensor:
+    return lab_to_rgb(lab)
 
 
 def soft_gamut_compress(rgb: Tensor) -> Tensor:
@@ -386,10 +405,10 @@ def run_global_matching(
     timings["neural_preset_inference"] = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    base_lab = rgb_to_oklab(base_rgb)
-    source_lab = rgb_to_oklab(source)
-    reference_resized_lab = rgb_to_oklab(reference_resized)
-    timings["oklab_tensors"] = time.perf_counter() - t2
+    base_lab = rgb_to_lab(base_rgb)
+    source_lab = rgb_to_lab(source)
+    reference_resized_lab = rgb_to_lab(reference_resized)
+    timings["lab_tensors"] = time.perf_counter() - t2
 
     paths = {
         "base_intermediate": str(output_dir / "base_intermediate.png"),

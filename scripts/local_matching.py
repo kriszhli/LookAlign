@@ -1,7 +1,7 @@
 """LookAlign V0.3.6 local diffuse mood matching.
 
 This stage is intentionally deterministic and lightweight. It approximates a
-colorful diffuse-shading transfer by operating on smooth OKLab maps while
+colorful diffuse-shading transfer by operating on smooth CIE Lab maps while
 leaving base-intermediate detail in place.
 """
 
@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw
 from scripts.global_matching import (
     Tensor,
     image_stats_from_lab,
-    oklab_to_rgb,
+    lab_to_rgb,
     save_gray,
     save_rgb,
     soft_gamut_compress,
@@ -61,17 +61,17 @@ class LocalMatchingConfig:
     map_smoothing_strength: float = 0.35
     diffuse_proxy_long_edge: int = 320
     diffuse_blur_passes: int = 4
-    max_diffuse_luma_delta: float = 0.10
+    max_diffuse_luma_delta: float = 10.0
     max_diffuse_hue_delta: float = 0.35
     min_diffuse_chroma_scale: float = 0.80
     max_diffuse_chroma_scale: float = 1.25
-    low_chroma_start: float = 0.006
-    low_chroma_end: float = 0.025
+    low_chroma_start: float = 1.5
+    low_chroma_end: float = 6.0
     clipped_start: float = 0.965
     clipped_end: float = 0.995
-    shadow_start: float = 0.020
-    shadow_end: float = 0.120
-    delta_sanity_luma: float = 0.180
+    shadow_start: float = 2.0
+    shadow_end: float = 12.0
+    delta_sanity_luma: float = 18.0
     delta_sanity_hue: float = 0.700
     delta_sanity_chroma_scale: float = 0.600
     confidence_blur_passes: int = 6
@@ -106,12 +106,16 @@ def resize_long_edge_with_scale(img: Tensor, long_edge: int) -> tuple[Tensor, fl
     return F.interpolate(img, size=(target_h, target_w), mode="bicubic", align_corners=False).clamp(0.0, 1.0), scale
 
 
-def low_frequency_proxy_oklab(lab: Tensor, cfg: LocalMatchingConfig) -> Tensor:
+def low_frequency_proxy_lab(lab: Tensor, cfg: LocalMatchingConfig) -> Tensor:
     _, _, height, width = lab.shape
     proxy = resize_long_edge_unclamped(lab, cfg.diffuse_proxy_long_edge)
     for _ in range(max(1, int(cfg.diffuse_blur_passes))):
         proxy = F.avg_pool2d(F.pad(proxy, (2, 2, 2, 2), mode="replicate"), kernel_size=5, stride=1)
     return resize_to_hw_unclamped(proxy, height, width)
+
+
+def low_frequency_proxy_oklab(lab: Tensor, cfg: LocalMatchingConfig) -> Tensor:
+    return low_frequency_proxy_lab(lab, cfg)
 
 
 def chroma_and_hue(lab: Tensor) -> tuple[Tensor, Tensor]:
@@ -163,7 +167,7 @@ def reference_specular_confidence(ref_lab: Tensor, ref_rgb: Tensor, cfg: LocalMa
     saturation = (max_rgb - min_rgb) / max_rgb.clamp_min(1e-4)
     bright = smoothstep(cfg.clipped_start, cfg.clipped_end, max_rgb)
     low_saturation = 1.0 - smoothstep(0.08, 0.22, saturation)
-    low_chroma = 1.0 - smoothstep(0.015, 0.050, ref_chroma)
+    low_chroma = 1.0 - smoothstep(4.0, 12.0, ref_chroma)
     specular = (bright * torch.maximum(low_saturation, low_chroma)).clamp(0.0, 1.0)
     return 1.0 - specular
 
@@ -401,7 +405,7 @@ def build_aligned_reference_fields(
     alignment: Dict[str, Any],
     cfg: LocalMatchingConfig,
 ) -> Dict[str, Any]:
-    base_proxy = low_frequency_proxy_oklab(base_lab, cfg)
+    base_proxy = low_frequency_proxy_lab(base_lab, cfg)
     if not alignment["valid"]:
         ref_lab = reference_lab
         ref_rgb = reference_rgb
@@ -411,8 +415,8 @@ def build_aligned_reference_fields(
         ref_lab, valid = warp_reference_to_base(reference_lab, alignment["homography"], base_lab.shape[2], base_lab.shape[3])
         ref_rgb, _ = warp_reference_to_base(reference_rgb, alignment["homography"], base_lab.shape[2], base_lab.shape[3])
         mode = "lightglue_aligned_proxy"
-    ref_proxy = low_frequency_proxy_oklab(ref_lab, cfg)
-    confidence = confidence_maps(base_lab, base_proxy, ref_lab, ref_proxy, oklab_to_rgb(base_lab), ref_rgb, cfg)
+    ref_proxy = low_frequency_proxy_lab(ref_lab, cfg)
+    confidence = confidence_maps(base_lab, base_proxy, ref_lab, ref_proxy, lab_to_rgb(base_lab), ref_rgb, cfg)
     confidence["combined_confidence"] = (confidence["combined_confidence"] * valid).clamp(0.0, 1.0)
     confidence["ref_residual_rejection"] = 1.0 - (confidence["ref_residual_confidence"] * valid).clamp(0.0, 1.0)
     for key in ALIGNMENT_KEYS:
@@ -649,7 +653,7 @@ def apply_local_maps(
     chroma_scale = delta_maps["chroma_scale"]
 
     source_chroma, source_hue = chroma_and_hue(base_lab)
-    final_l = (base_lab[:, 0:1] + luma_confidence * luma_delta).clamp(0.0, 1.0)
+    final_l = (base_lab[:, 0:1] + luma_confidence * luma_delta).clamp(0.0, 100.0)
     final_hue = source_hue + hue_confidence * hue_delta
     final_chroma = source_chroma * (1.0 + chroma_confidence * (chroma_scale - 1.0))
     final_ab = torch.cat((torch.cos(final_hue), torch.sin(final_hue)), dim=1) * final_chroma
@@ -684,8 +688,8 @@ def run_local_diffuse_matching(
     timings: Dict[str, float] = {}
 
     t0 = time.perf_counter()
-    base_proxy = low_frequency_proxy_oklab(base_intermediate_lab, cfg)
-    ref_proxy = low_frequency_proxy_oklab(reference_resized_lab, cfg)
+    base_proxy = low_frequency_proxy_lab(base_intermediate_lab, cfg)
+    ref_proxy = low_frequency_proxy_lab(reference_resized_lab, cfg)
     timings["diffuse_proxy"] = time.perf_counter() - t0
 
     t1 = time.perf_counter()
@@ -719,7 +723,7 @@ def run_local_diffuse_matching(
     )
     applied_confidence = aligned_fields["confidence"]
     local_mode = aligned_fields["mode"]
-    final_rgb = soft_gamut_compress(oklab_to_rgb(final_lab))
+    final_rgb = soft_gamut_compress(lab_to_rgb(final_lab))
     timings["local_apply"] = time.perf_counter() - t_apply
 
     paths = dict(global_metrics["paths"])
