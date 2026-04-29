@@ -8,11 +8,10 @@ Designed for near real-time performance, LookAlign is built for modern image and
 
 ## Versions
 
-- `V0.4.3` - Replaced the SA-LUT global stage with **Neural Preset / DNCM** global matching. The UI contract is unchanged: Neural Preset writes `base_intermediate.png`, then the existing bilateral transfer stage produces the final output.
+- `V0.4.3` - Uses **Neural Preset / DNCM** as the global stage in `sRGB`, then converts `base_intermediate_rgb` and the resized reference to **CIE Lab** for the bilateral-grid affine transfer before converting back to `sRGB` for gamut compression and saving.
 - `V0.4.2` - Fixed "washed out" issue by restricting the bilateral grid to correct **chrominance (a/b) only**. The global 3D LUT already perfectly matches the L percentiles, and applying per-cell L offsets was compressing the tonal range. Removed the global Reinhard standard deviation matching which was increasing pixel-wise error.
 - `V0.4.1` - Reference denoising before bilateral grid splatting. AI-generated film-style references contain grain noise that biases per-cell means (especially lifting shadows). A configurable Gaussian blur (`ref_denoise_sigma=1.0`) suppresses grain while preserving broad color patterns.
 - `V0.4.0` - Replaced low-frequency proxy deltas with **bilateral-grid local affine** transfer. Edge-awareness built into the grid structure (luminance-binned cells); misalignment tolerance via statistics-based cell fitting. Mean-shift-only per cell + global Reinhard std-match. Eliminates `LightGlue` dependency, reduces hyperparameters to 9, runs in ~0.3s on MPS.
-- `V0.3.6` - Switched to linear-RGB 3D LUT global fit; `LightGlue`+`ALIKED`-first local alignment with warped reference and dense OKLab diffuse corrections + confidence.
 - `V0.3.5` - Global `OT`/`SVD` base with `LightGlue`+`ALIKED`-guided sparse sampling into smooth `MPS` local OKLab correction maps + confidence and fallback.
 - `V0.3.1` - Replaced global LUT/`BGrid` with sliced partial `OT` -> `SVD`-smoothed LUT, producing a conservative base intermediate.
 - `V0.3.0` - Full redesign to ML-driven appearance transform from source/reference pairs with learned global LUT fitting.

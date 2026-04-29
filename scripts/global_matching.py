@@ -29,7 +29,7 @@ else:
 Tensor = torch.Tensor
 ROOT = Path(__file__).resolve().parents[1]
 GLOBAL_STAGE_VERSION = "v0.4.3-global-neural-preset-dncm"
-PIPELINE_VERSION = "v0.4.3-neural-preset-lightglue-local-diffuse"
+PIPELINE_VERSION = "v0.4.3-neural-preset-bilateral-lab"
 DEFAULT_NEURAL_PRESET_CKPT = "ckpts/neural_preset/best.ckpt"
 NEURAL_PRESET_CKPT_SOURCE = "https://drive.google.com/open?id=1TZRVwIlzBBewwzgjrScrVzeynhBSLmm0&usp=drive_fs"
 
@@ -148,15 +148,6 @@ def lab_to_rgb(lab: Tensor) -> Tensor:
         dim=1,
     )
     return linear_to_srgb(linear)
-
-
-def rgb_to_oklab(rgb: Tensor) -> Tensor:
-    return rgb_to_lab(rgb)
-
-
-def oklab_to_rgb(lab: Tensor) -> Tensor:
-    return lab_to_rgb(lab)
-
 
 def soft_gamut_compress(rgb: Tensor) -> Tensor:
     return rgb.clamp(0.0, 1.0)

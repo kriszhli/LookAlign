@@ -484,8 +484,8 @@ def run_bilateral_transfer(
     # Compute aligned difference map for UI visualization ONLY
     ref_rgb = global_metrics["tensors"]["reference_resized_rgb"]
     import cv2
-    ref_L_full = (reference_resized_lab[0, 0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    out_L_full = (output_lab[0, 0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    ref_L_full = ((reference_resized_lab[0, 0].detach().cpu().numpy() / 100.0) * 255).clip(0, 255).astype(np.uint8)
+    out_L_full = ((output_lab[0, 0].detach().cpu().numpy() / 100.0) * 255).clip(0, 255).astype(np.uint8)
     inst = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
     flow_full = inst.calc(ref_L_full, out_L_full, None)
     
