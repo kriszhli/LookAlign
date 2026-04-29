@@ -36,9 +36,9 @@ PIPELINE_VERSION = "v0.4.4-edge-aware-bilateral-affine"
 
 @dataclass
 class BilateralTransferConfig:
-    fit_long_edge: int = 512
-    spatial_bins: int = 32          # grid cells along the long edge
-    luma_bins: int = 32             # luminance bins
+    fit_long_edge: int = 768
+    spatial_bins: int = 48          # grid cells along the long edge
+    luma_bins: int = 40             # luminance bins
     ref_denoise_sigma: float = 0.5  # Gaussian blur σ on reference before splatting;
                                     # suppresses film grain that biases cell means
     affine_regularization: float = 0.05  # pull toward identity
@@ -51,6 +51,8 @@ class BilateralTransferConfig:
     coeff_smooth_spatial_sigma: float = 0.06
     coeff_smooth_luma_sigma: float = 0.05
     coeff_smooth_confidence_power: float = 1.5
+    coeff_smooth_scale_blend: float = 0.15
+    coeff_smooth_offset_blend: float = 0.55
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -293,6 +295,8 @@ def smooth_affine_grid(
         (2, 1, luma_sigma),
     )
 
+    raw = out.clone()
+
     for _ in range(cfg.coeff_smooth_iterations):
         numer = confidence * out
         denom = confidence.clone()
@@ -320,9 +324,22 @@ def smooth_affine_grid(
             denom[tuple(src)] += w_dst_to_src
 
         smoothed = numer / denom.clamp_min(1e-6)
-        out = confidence * out + (1.0 - confidence) * smoothed
+        out = smoothed
 
-    return out
+    out_final = raw.clone()
+
+    scale_mix = cfg.coeff_smooth_scale_blend
+    offset_mix = cfg.coeff_smooth_offset_blend
+    conf_keep = confidence.clamp(0.0, 1.0)
+    scale_weight = scale_mix * (1.0 - conf_keep)
+    offset_weight = offset_mix * (1.0 - conf_keep)
+
+    for idx in (0, 5, 10):
+        out_final[..., idx] = raw[..., idx] * (1.0 - scale_weight[..., 0]) + out[..., idx] * scale_weight[..., 0]
+    for idx in (3, 7, 11):
+        out_final[..., idx] = raw[..., idx] * (1.0 - offset_weight[..., 0]) + out[..., idx] * offset_weight[..., 0]
+
+    return out_final
 
 
 def bilateral_slice(
