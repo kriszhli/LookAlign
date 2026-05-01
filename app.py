@@ -165,7 +165,7 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         extra_paths=alignment["paths"],
         extra_metrics={"xfeat_alignment": alignment["metrics"]},
     )
-    neural_seconds = global_metrics["timings"].get("neural_preset_inference", time.perf_counter() - neural_started)
+    neural_seconds = time.perf_counter() - neural_started
     tensors = global_metrics["tensors"]
     base_path = global_metrics["paths"]["base_intermediate"]
     yield (
@@ -195,8 +195,28 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     )
     bilateral_seconds = time.perf_counter() - bilateral_started
     paths = metrics["paths"]
-    save_seconds = float(metrics["timings"].get("save_debug", 0.0))
-    bilateral_compute_seconds = max(bilateral_seconds - save_seconds, 0.0)
+    timing_map = metrics["timings"]
+    bilateral_grid_seconds = sum(
+        float(timing_map.get(key, 0.0))
+        for key in (
+            "downsample",
+            "ref_denoise",
+            "splat",
+            "solve_affine",
+            "smooth_affine",
+            "save_grid_debug",
+        )
+    )
+    final_output_seconds = sum(
+        float(timing_map.get(key, 0.0))
+        for key in (
+            "bilateral_slice",
+            "detail_residual",
+            "guided_filter",
+            "output_rgb",
+            "save_final_output",
+        )
+    )
     yield (
         xfeat_path,
         base_path,
@@ -206,8 +226,8 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         paths["final_output"],
         format_arrow_time("XFeat*", xfeat_seconds),
         format_arrow_time("Neural Preset", neural_seconds),
-        format_arrow_time("Bilateral Grid", bilateral_compute_seconds),
-        format_arrow_time("Final Output", save_seconds),
+        format_arrow_time("Bilateral Grid", bilateral_grid_seconds),
+        format_arrow_time("Final Output", final_output_seconds),
     )
 
 
@@ -314,8 +334,8 @@ def build_app() -> gr.Blocks:
 
         with gr.Column():
             with gr.Row(elem_classes="pipeline-arrow-row"):
-                arrow_lightglue = gr.HTML(value=format_arrow_time("XFeat*", None))
-            v4_lightglue = gr.Image(
+                arrow_xfeat = gr.HTML(value=format_arrow_time("XFeat*", None))
+            v4_xfeat = gr.Image(
                 label="XFeat* matches",
                 type="filepath",
                 elem_classes="stage-image",
@@ -369,13 +389,13 @@ def build_app() -> gr.Blocks:
             fn=run_v040,
             inputs=[source_image, reference_image],
             outputs=[
-                v4_lightglue,
+                v4_xfeat,
                 v4_base,
                 v4_grid,
                 v4_ref,
                 v4_diff,
                 v4_final,
-                arrow_lightglue,
+                arrow_xfeat,
                 arrow_neural,
                 arrow_bilateral,
                 arrow_final,
