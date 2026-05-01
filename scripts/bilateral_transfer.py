@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image, ImageDraw
 
 from scripts.global_matching import (
     Tensor,
@@ -53,6 +54,11 @@ class BilateralTransferConfig:
     coeff_smooth_confidence_power: float = 1.5
     coeff_smooth_scale_blend: float = 0.15
     coeff_smooth_offset_blend: float = 0.55
+    detail_sigma: float = 2.0
+    detail_max_boost: float = 8.0
+    detail_positive_bias: float = 0.75
+    detail_edge_sigma: float = 0.08
+    detail_strength: float = 0.85
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -418,6 +424,45 @@ def _clamp_lab_l(lab: Tensor) -> Tensor:
     return out
 
 
+def apply_luma_detail_residual(
+    base_lab: Tensor,
+    ref_lab: Tensor,
+    output_lab: Tensor,
+    cfg: BilateralTransferConfig,
+) -> tuple[Tensor, Tensor]:
+    """Restore fine positive luminance detail after coarse bilateral transfer."""
+    if cfg.detail_strength <= 1e-4 or cfg.detail_sigma <= 0.1:
+        zero = torch.zeros_like(output_lab[:, 0:1])
+        return output_lab, zero
+
+    base_l = base_lab[:, 0:1]
+    ref_l = ref_lab[:, 0:1]
+    out_l = output_lab[:, 0:1]
+
+    base_low = _spatial_gaussian_blur(base_l, cfg.detail_sigma)
+    ref_low = _spatial_gaussian_blur(ref_l, cfg.detail_sigma)
+    out_low = _spatial_gaussian_blur(out_l, cfg.detail_sigma)
+
+    base_detail = base_l - base_low
+    ref_detail = ref_l - ref_low
+    out_detail = out_l - out_low
+
+    # Favor restoring highlight-like positive detail the reference has more strongly.
+    positive_gate = torch.sigmoid((ref_detail - cfg.detail_positive_bias * base_detail) / 1.5)
+    detail_delta = (ref_detail - out_detail).clamp_min(0.0)
+
+    guide = (base_l / 100.0).clamp(0.0, 1.0)
+    guide_low = _spatial_gaussian_blur(guide, cfg.detail_sigma)
+    edge_barrier = torch.exp(-((guide - guide_low).abs() / max(cfg.detail_edge_sigma, 1e-6)).square())
+
+    residual = detail_delta * positive_gate * edge_barrier
+    residual = residual.clamp_max(cfg.detail_max_boost) * cfg.detail_strength
+
+    output = output_lab.clone()
+    output[:, 0:1] = (output[:, 0:1] + residual).clamp(0.0, 100.0)
+    return output, residual
+
+
 # ---------------------------------------------------------------------------
 # Guided filter (He et al.) for optional post-processing
 # ---------------------------------------------------------------------------
@@ -460,6 +505,35 @@ def _grid_to_vis(grid: Tensor, channel: int, size: int = 0) -> np.ndarray:
         img = _PILImage.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
         arr = np.array(img.resize((size, size), _PILImage.NEAREST), dtype=np.float32) / 255.0
     return arr
+
+
+def _grid_viewport(grid: Tensor, size: int = 256) -> np.ndarray:
+    """Render a compact viewport of key bilateral-grid coefficient channels."""
+    panels = [
+        ("L scale", _grid_to_vis(grid, 0, size=size)),
+        ("L offset", _grid_to_vis(grid, 3, size=size)),
+        ("a scale", _grid_to_vis(grid, 5, size=size)),
+        ("a offset", _grid_to_vis(grid, 7, size=size)),
+        ("b scale", _grid_to_vis(grid, 10, size=size)),
+        ("b offset", _grid_to_vis(grid, 11, size=size)),
+    ]
+
+    tile_w = size
+    tile_h = size + 18
+    cols = 3
+    rows = 2
+    canvas = Image.new("RGB", (cols * tile_w, rows * tile_h), (12, 12, 12))
+    draw = ImageDraw.Draw(canvas)
+
+    for idx, (label, panel) in enumerate(panels):
+        x = (idx % cols) * tile_w
+        y = (idx // cols) * tile_h
+        panel_rgb = Image.fromarray((np.clip(panel, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8), mode="L").convert("RGB")
+        canvas.paste(panel_rgb, (x, y + 18))
+        draw.rectangle((x, y, x + tile_w - 1, y + 17), fill=(0, 0, 0))
+        draw.text((x + 6, y + 2), label, fill=(255, 255, 255))
+
+    return np.asarray(canvas).astype(np.float32) / 255.0
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +603,15 @@ def run_bilateral_transfer(
     output_lab = _clamp_lab_l(output_lab)
     timings["bilateral_slice"] = time.perf_counter() - t4
 
-
+    # ---- Stage 3b: restore fine luminance detail from the reference ----
+    t4b = time.perf_counter()
+    output_lab, detail_residual_l = apply_luma_detail_residual(
+        base_intermediate_lab,
+        reference_resized_lab,
+        output_lab,
+        cfg,
+    )
+    timings["detail_residual"] = time.perf_counter() - t4b
 
     # ---- Optional guided-filter post-pass ----
     t5 = time.perf_counter()
@@ -596,7 +678,12 @@ def run_bilateral_transfer(
     base_chroma = base_intermediate_lab[:, 1:3].norm(dim=1)
     edit_delta_l = ((output_lab[:, 0] - base_intermediate_lab[:, 0]) / 100.0).squeeze(0).detach().cpu().numpy()
     edit_delta_c = ((out_chroma - base_chroma) / 100.0).squeeze(0).detach().cpu().numpy()
-    edit_strength = np.clip((0.75 * np.abs(edit_delta_l) + 0.25 * np.abs(edit_delta_c)) * 6.0, 0.0, 1.0)
+    detail_residual_np = (detail_residual_l[:, 0] / 100.0).squeeze(0).detach().cpu().numpy()
+    edit_strength = np.clip(
+        (0.55 * np.abs(edit_delta_l) + 0.15 * np.abs(edit_delta_c) + 0.30 * np.abs(detail_residual_np)) * 6.0,
+        0.0,
+        1.0,
+    )
     edit_mask = (edit_strength > 0.02).astype(np.float32)[..., None]
     output_rgb_np = to_hwc_np(output_rgb)
     base_rgb_np = to_hwc_np(base_intermediate_rgb)
@@ -606,12 +693,14 @@ def run_bilateral_transfer(
     t6 = time.perf_counter()
     paths = dict(global_metrics.get("paths", {}))
     paths.update({
+        "grid_viewport": str(output_dir / "grid_viewport.png"),
         "final_output": str(output_dir / "final_output.png"),
         "edit_map": str(output_dir / "edit_map.png"),
         "diff_map": str(output_dir / "diff_map.png"),
         "metrics": str(output_dir / "metrics.json"),
     })
 
+    save_rgb(paths["grid_viewport"], _grid_viewport(grid))
     save_rgb(paths["final_output"], to_hwc_np(output_rgb))
     
     from PIL import Image as _PILImage
