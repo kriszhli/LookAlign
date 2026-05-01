@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Gradio UI for LookAlign V0.4.4."""
+"""Local Gradio UI for LookAlign V0.4.5."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from io import BytesIO
 
 from scripts.global_matching import GlobalMatchingConfig, run_global_matching
 from scripts.bilateral_transfer import BilateralTransferConfig, run_bilateral_transfer
+from scripts.lightGlue import LightGlueAlignmentConfig, run_lightglue_alignment
 
 
 ROOT = Path(__file__).resolve().parent
@@ -128,7 +129,17 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
     reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
     run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "v040"
 
-    global_metrics = run_global_matching(source, reference, run_dir, GlobalMatchingConfig())
+    alignment = run_lightglue_alignment(source, reference, run_dir, LightGlueAlignmentConfig())
+    global_metrics = run_global_matching(
+        source,
+        reference,
+        run_dir,
+        GlobalMatchingConfig(),
+        source_rgb_np=alignment["source_rgb"],
+        reference_rgb_np=alignment["reference_rgb"],
+        extra_paths=alignment["paths"],
+        extra_metrics={"lightglue_alignment": alignment["metrics"]},
+    )
     tensors = global_metrics["tensors"]
     metrics = run_bilateral_transfer(
         base_intermediate_lab=tensors["base_intermediate_lab"],
@@ -143,7 +154,9 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
     )
     paths = metrics["paths"]
     return (
+        paths.get("lightglue_matches", ""),
         paths["base_intermediate"],
+        paths["grid_viewport"],
         paths["final_output"],
         paths.get("edit_map", ""),
         paths.get("diff_map", ""),
@@ -151,12 +164,63 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
 
 
 css = """
-/* No global CSS needed for gallery, handled by ExamplesGallery custom component */
+.pipeline-stage {
+    margin: 0;
+    padding: 0;
+}
+
+.pipeline-stage-title {
+    margin: 0 0 6px;
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: #1e293b;
+}
+
+.pipeline-arrow {
+    text-align: center;
+    font-size: 28px;
+    line-height: 1;
+    color: #64748b;
+    margin: 2px 0 8px;
+}
+
+.debug-row {
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.debug-row > div {
+    flex: 1 1 280px;
+}
+
+.stage-image,
+.debug-row .stage-image {
+    min-height: 320px;
+}
+
+.stage-image img,
+.debug-row .stage-image img {
+    height: 320px !important;
+    width: 100%;
+    object-fit: contain;
+}
+
+@media (max-width: 900px) {
+    .stage-image,
+    .debug-row .stage-image {
+        min-height: 240px;
+    }
+
+    .stage-image img,
+    .debug-row .stage-image img {
+        height: 240px !important;
+    }
+}
 """
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="LookAlign V0.4.4") as demo:
-        gr.Markdown("# LookAlign V0.4.4 — Neural Preset + Bilateral Transfer")
+    with gr.Blocks(title="LookAlign V0.4.5") as demo:
+        gr.Markdown("# LookAlign V0.4.5 — Neural Preset + Bilateral Transfer")
 
         gr.Markdown("### Examples")
         examples_gallery = ExamplesGallery()
@@ -171,22 +235,64 @@ def build_app() -> gr.Blocks:
             outputs=[source_image, reference_image]
         )
 
-        run_v040_btn = gr.Button("Run V0.4.4", variant="primary")
+        run_v040_btn = gr.Button("Run V0.4.5", variant="primary")
 
-        gr.Markdown("## Outputs")
-        with gr.Row():
-            v4_base = gr.Image(label="Base intermediate (after Neural Preset)", type="filepath")
-            v4_final = gr.Image(label="V0.4.4 Final output", type="filepath")
+        gr.Markdown("## Debug Pipeline")
 
-        gr.Markdown("## Alignment and Difference")
-        with gr.Row():
-            v4_ref = gr.Image(label="Bilateral Transfer Edit Map", type="filepath")
-            v4_diff = gr.Image(label="Difference Map (Output vs Aligned Reference)", type="filepath")
+        with gr.Column():
+            with gr.Group(elem_classes="pipeline-stage"):
+                gr.HTML("<div class='pipeline-stage-title'>Alignment</div>")
+                v4_lightglue = gr.Image(
+                    label="LightGlue matches",
+                    type="filepath",
+                    elem_classes="stage-image",
+                )
+
+            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+
+            with gr.Group(elem_classes="pipeline-stage"):
+                gr.HTML("<div class='pipeline-stage-title'>Neural Preset</div>")
+                v4_base = gr.Image(
+                    label="Base intermediate (after Neural Preset)",
+                    type="filepath",
+                    elem_classes="stage-image",
+                )
+
+            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+
+            with gr.Group(elem_classes="pipeline-stage"):
+                gr.HTML("<div class='pipeline-stage-title'>Bilateral Grid</div>")
+                with gr.Row(elem_classes="debug-row"):
+                    v4_grid = gr.Image(
+                        label="Bilateral grid viewport",
+                        type="filepath",
+                        elem_classes="stage-image",
+                    )
+                    v4_ref = gr.Image(
+                        label="Bilateral Transfer Edit Map",
+                        type="filepath",
+                        elem_classes="stage-image",
+                    )
+                    v4_diff = gr.Image(
+                        label="Difference Map (Output vs Aligned Reference)",
+                        type="filepath",
+                        elem_classes="stage-image",
+                    )
+
+            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+
+            with gr.Group(elem_classes="pipeline-stage"):
+                gr.HTML("<div class='pipeline-stage-title'>Final Output</div>")
+                v4_final = gr.Image(
+                    label="V0.4.5 Final output",
+                    type="filepath",
+                    elem_classes="stage-image",
+                )
 
         run_v040_btn.click(
             fn=run_v040,
             inputs=[source_image, reference_image],
-            outputs=[v4_base, v4_final, v4_ref, v4_diff],
+            outputs=[v4_lightglue, v4_base, v4_grid, v4_final, v4_ref, v4_diff],
             queue=True,
         )
 

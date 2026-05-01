@@ -28,8 +28,8 @@ else:
 
 Tensor = torch.Tensor
 ROOT = Path(__file__).resolve().parents[1]
-GLOBAL_STAGE_VERSION = "v0.4.4-global-neural-preset-dncm"
-PIPELINE_VERSION = "v0.4.4-neural-preset-bilateral-lab"
+GLOBAL_STAGE_VERSION = "v0.4.5-global-neural-preset-dncm"
+PIPELINE_VERSION = "v0.4.5-neural-preset-bilateral-lab"
 DEFAULT_NEURAL_PRESET_CKPT = "ckpts/neural_preset/best.ckpt"
 NEURAL_PRESET_CKPT_SOURCE = "https://drive.google.com/open?id=1TZRVwIlzBBewwzgjrScrVzeynhBSLmm0&usp=drive_fs"
 
@@ -375,6 +375,11 @@ def run_global_matching(
     reference_path: str | Path,
     output_dir: str | Path,
     config: Optional[GlobalMatchingConfig | Dict[str, Any]] = None,
+    *,
+    source_rgb_np: Optional[np.ndarray] = None,
+    reference_rgb_np: Optional[np.ndarray] = None,
+    extra_paths: Optional[Dict[str, str]] = None,
+    extra_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     cfg = config if isinstance(config, GlobalMatchingConfig) else GlobalMatchingConfig(**(config or {}))
     device = select_torch_device()
@@ -383,8 +388,8 @@ def run_global_matching(
     timings: Dict[str, float] = {}
 
     t0 = time.perf_counter()
-    source_np = load_rgb(source_path)
-    reference_np = load_rgb(reference_path)
+    source_np = source_rgb_np if source_rgb_np is not None else load_rgb(source_path)
+    reference_np = reference_rgb_np if reference_rgb_np is not None else load_rgb(reference_path)
     source = to_nchw(source_np, device)
     reference = to_nchw(reference_np, device)
     reference_resized = resize_to_hw(reference, source.shape[2], source.shape[3])
@@ -408,6 +413,8 @@ def run_global_matching(
         "lut_support": str(output_dir / "lut_support.png"),
         "metrics": str(output_dir / "metrics.json"),
     }
+    if extra_paths:
+        paths.update(extra_paths)
     t3 = time.perf_counter()
     save_rgb(paths["base_intermediate"], to_hwc_np(base_rgb))
     save_rgb(paths["reference_resized"], to_hwc_np(reference_resized))
@@ -434,6 +441,8 @@ def run_global_matching(
         **stats,
         "paths": paths,
     }
+    if extra_metrics:
+        metrics.update(extra_metrics)
     Path(paths["metrics"]).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     metrics["tensors"] = {
         "base_intermediate_lab": base_lab,

@@ -28,7 +28,7 @@ from scripts.global_matching import (
     to_hwc_np,
 )
 
-PIPELINE_VERSION = "v0.4.4-edge-aware-bilateral-affine"
+PIPELINE_VERSION = "v0.4.5-edge-aware-bilateral-affine"
 
 
 # ---------------------------------------------------------------------------
