@@ -57,8 +57,10 @@ class BilateralTransferConfig:
     detail_sigma: float = 2.0
     detail_max_boost: float = 8.0
     detail_positive_bias: float = 0.75
+    detail_negative_bias: float = 0.75
     detail_edge_sigma: float = 0.08
     detail_strength: float = 0.85
+    detail_negative_strength: float = 0.65
     guided_filter_radius: int = 0       # 0 = disabled; GF destroys source detail
     guided_filter_eps: float = 0.01
 
@@ -430,7 +432,12 @@ def apply_luma_detail_residual(
     output_lab: Tensor,
     cfg: BilateralTransferConfig,
 ) -> tuple[Tensor, Tensor]:
-    """Restore fine positive luminance detail after coarse bilateral transfer."""
+    """Restore fine luminance detail after coarse bilateral transfer.
+
+    The bilateral grid gets the low-frequency tone structure close to the
+    reference, but it can soften local luminance contrast. Restore signed
+    residual detail so both highlight and shadow contrast can come back.
+    """
     if cfg.detail_strength <= 1e-4 or cfg.detail_sigma <= 0.1:
         zero = torch.zeros_like(output_lab[:, 0:1])
         return output_lab, zero
@@ -447,16 +454,19 @@ def apply_luma_detail_residual(
     ref_detail = ref_l - ref_low
     out_detail = out_l - out_low
 
-    # Favor restoring highlight-like positive detail the reference has more strongly.
     positive_gate = torch.sigmoid((ref_detail - cfg.detail_positive_bias * base_detail) / 1.5)
-    detail_delta = (ref_detail - out_detail).clamp_min(0.0)
+    negative_gate = torch.sigmoid(((-ref_detail) - cfg.detail_negative_bias * (-base_detail)) / 1.5)
+    detail_delta = ref_detail - out_detail
+
+    positive_residual = detail_delta.clamp_min(0.0) * positive_gate * cfg.detail_strength
+    negative_residual = detail_delta.clamp_max(0.0) * negative_gate * cfg.detail_negative_strength
 
     guide = (base_l / 100.0).clamp(0.0, 1.0)
     guide_low = _spatial_gaussian_blur(guide, cfg.detail_sigma)
     edge_barrier = torch.exp(-((guide - guide_low).abs() / max(cfg.detail_edge_sigma, 1e-6)).square())
 
-    residual = detail_delta * positive_gate * edge_barrier
-    residual = residual.clamp_max(cfg.detail_max_boost) * cfg.detail_strength
+    residual = (positive_residual + negative_residual) * edge_barrier
+    residual = residual.clamp(-cfg.detail_max_boost, cfg.detail_max_boost)
 
     output = output_lab.clone()
     output[:, 0:1] = (output[:, 0:1] + residual).clamp(0.0, 100.0)
