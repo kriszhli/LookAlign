@@ -15,7 +15,7 @@ from io import BytesIO
 
 from scripts.global_matching import GlobalMatchingConfig, run_global_matching
 from scripts.bilateral_transfer import BilateralTransferConfig, run_bilateral_transfer
-from scripts.lightGlue import LightGlueAlignmentConfig, run_lightglue_alignment
+from scripts.xfeat import XFeatAlignmentConfig, run_xfeat_alignment
 
 
 ROOT = Path(__file__).resolve().parent
@@ -136,19 +136,19 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
     run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "v040"
 
-    lightglue_started = time.perf_counter()
-    alignment = run_lightglue_alignment(source, reference, run_dir, LightGlueAlignmentConfig())
-    lightglue_seconds = time.perf_counter() - lightglue_started
+    xfeat_started = time.perf_counter()
+    alignment = run_xfeat_alignment(source, reference, run_dir, XFeatAlignmentConfig())
+    xfeat_seconds = time.perf_counter() - xfeat_started
 
-    lightglue_path = alignment["paths"].get("lightglue_matches", "")
+    xfeat_path = alignment["paths"].get("xfeat_matches", "")
     yield (
-        lightglue_path,
+        xfeat_path,
         None,
         None,
         None,
         None,
         None,
-        format_arrow_time("LightGlue", lightglue_seconds),
+        format_arrow_time("XFeat*", xfeat_seconds),
         format_arrow_time("Neural Preset", None),
         format_arrow_time("Bilateral Grid", None),
         format_arrow_time("Final Output", None),
@@ -163,19 +163,19 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         source_rgb_np=alignment["source_rgb"],
         reference_rgb_np=alignment["reference_rgb"],
         extra_paths=alignment["paths"],
-        extra_metrics={"lightglue_alignment": alignment["metrics"]},
+        extra_metrics={"xfeat_alignment": alignment["metrics"]},
     )
     neural_seconds = global_metrics["timings"].get("neural_preset_inference", time.perf_counter() - neural_started)
     tensors = global_metrics["tensors"]
     base_path = global_metrics["paths"]["base_intermediate"]
     yield (
-        lightglue_path,
+        xfeat_path,
         base_path,
         None,
         None,
         None,
         None,
-        format_arrow_time("LightGlue", lightglue_seconds),
+        format_arrow_time("XFeat*", xfeat_seconds),
         format_arrow_time("Neural Preset", neural_seconds),
         format_arrow_time("Bilateral Grid", None),
         format_arrow_time("Final Output", None),
@@ -198,13 +198,13 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     save_seconds = float(metrics["timings"].get("save_debug", 0.0))
     bilateral_compute_seconds = max(bilateral_seconds - save_seconds, 0.0)
     yield (
-        lightglue_path,
+        xfeat_path,
         base_path,
         paths["grid_viewport"],
         paths.get("edit_map", ""),
         paths.get("diff_map", ""),
         paths["final_output"],
-        format_arrow_time("LightGlue", lightglue_seconds),
+        format_arrow_time("XFeat*", xfeat_seconds),
         format_arrow_time("Neural Preset", neural_seconds),
         format_arrow_time("Bilateral Grid", bilateral_compute_seconds),
         format_arrow_time("Final Output", save_seconds),
@@ -253,9 +253,19 @@ css = """
     min-height: 320px;
 }
 
+.final-output-image {
+    min-height: 460px;
+}
+
 .stage-image img,
 .debug-row .stage-image img {
     height: 320px !important;
+    width: 100%;
+    object-fit: contain;
+}
+
+.final-output-image img {
+    height: 460px !important;
     width: 100%;
     object-fit: contain;
 }
@@ -266,9 +276,17 @@ css = """
         min-height: 240px;
     }
 
+    .final-output-image {
+        min-height: 320px;
+    }
+
     .stage-image img,
     .debug-row .stage-image img {
         height: 240px !important;
+    }
+
+    .final-output-image img {
+        height: 320px !important;
     }
 }
 """
@@ -296,9 +314,9 @@ def build_app() -> gr.Blocks:
 
         with gr.Column():
             with gr.Row(elem_classes="pipeline-arrow-row"):
-                arrow_lightglue = gr.HTML(value=format_arrow_time("LightGlue", None))
+                arrow_lightglue = gr.HTML(value=format_arrow_time("XFeat*", None))
             v4_lightglue = gr.Image(
-                label="LightGlue matches",
+                label="XFeat* matches",
                 type="filepath",
                 elem_classes="stage-image",
                 container=False,
@@ -343,7 +361,7 @@ def build_app() -> gr.Blocks:
             v4_final = gr.Image(
                 label="V0.4.5 Final output",
                 type="filepath",
-                elem_classes="stage-image",
+                elem_classes="stage-image final-output-image",
                 container=False,
             )
 
