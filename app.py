@@ -131,7 +131,24 @@ def format_arrow_time(label: str, seconds: Optional[float]) -> str:
     return f"<div class='pipeline-arrow-line'><span class='pipeline-arrow-symbol'>&darr;</span><span class='pipeline-arrow-time'>{label} {seconds:.2f}s</span></div>"
 
 
+def format_final_total_time(total_seconds: Optional[float], io_seconds: Optional[float]) -> str:
+    if total_seconds is None or io_seconds is None:
+        return (
+            "<div class='pipeline-arrow-line'>"
+            "<span class='pipeline-arrow-symbol'>&darr;</span>"
+            "<span class='pipeline-arrow-time'>Final Output (Total computation time; I/O time)</span>"
+            "</div>"
+        )
+    return (
+        "<div class='pipeline-arrow-line'>"
+        "<span class='pipeline-arrow-symbol'>&darr;</span>"
+        f"<span class='pipeline-arrow-time'>Final Output (Total computation time = {total_seconds:.2f}s; I/O time = {io_seconds:.2f}s)</span>"
+        "</div>"
+    )
+
+
 def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Generator[Tuple[object, ...], None, None]:
+    wall_started = time.perf_counter()
     source = choose_input(source_path, DEFAULT_SOURCE, "source")
     reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
     run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "v040"
@@ -151,10 +168,9 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         format_arrow_time("XFeat*", xfeat_seconds),
         format_arrow_time("Neural Preset", None),
         format_arrow_time("Bilateral Grid", None),
-        format_arrow_time("Final Output", None),
+        format_final_total_time(None, None),
     )
 
-    neural_started = time.perf_counter()
     global_metrics = run_global_matching(
         source,
         reference,
@@ -165,7 +181,7 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         extra_paths=alignment["paths"],
         extra_metrics={"xfeat_alignment": alignment["metrics"]},
     )
-    neural_seconds = time.perf_counter() - neural_started
+    neural_seconds = float(global_metrics["timings"].get("neural_preset_inference", 0.0))
     tensors = global_metrics["tensors"]
     base_path = global_metrics["paths"]["base_intermediate"]
     yield (
@@ -178,10 +194,9 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         format_arrow_time("XFeat*", xfeat_seconds),
         format_arrow_time("Neural Preset", neural_seconds),
         format_arrow_time("Bilateral Grid", None),
-        format_arrow_time("Final Output", None),
+        format_final_total_time(None, None),
     )
 
-    bilateral_started = time.perf_counter()
     metrics = run_bilateral_transfer(
         base_intermediate_lab=tensors["base_intermediate_lab"],
         base_intermediate_rgb=tensors["base_intermediate_rgb"],
@@ -193,7 +208,6 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         global_metrics=global_metrics,
         config=BilateralTransferConfig(),
     )
-    bilateral_seconds = time.perf_counter() - bilateral_started
     paths = metrics["paths"]
     timing_map = metrics["timings"]
     bilateral_grid_seconds = sum(
@@ -204,7 +218,6 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
             "splat",
             "solve_affine",
             "smooth_affine",
-            "save_grid_debug",
         )
     )
     final_output_seconds = sum(
@@ -214,9 +227,11 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
             "detail_residual",
             "guided_filter",
             "output_rgb",
-            "save_final_output",
         )
     )
+    total_compute_seconds = xfeat_seconds + neural_seconds + bilateral_grid_seconds + final_output_seconds
+    total_wall_seconds = time.perf_counter() - wall_started
+    io_seconds = max(total_wall_seconds - total_compute_seconds, 0.0)
     yield (
         xfeat_path,
         base_path,
@@ -227,7 +242,7 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
         format_arrow_time("XFeat*", xfeat_seconds),
         format_arrow_time("Neural Preset", neural_seconds),
         format_arrow_time("Bilateral Grid", bilateral_grid_seconds),
-        format_arrow_time("Final Output", final_output_seconds),
+        format_final_total_time(total_compute_seconds, io_seconds),
     )
 
 

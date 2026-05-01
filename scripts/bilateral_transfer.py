@@ -625,9 +625,12 @@ def run_bilateral_transfer(
         output_lab = _clamp_lab_l(output_lab)
     timings["guided_filter"] = time.perf_counter() - t5
 
+    t_rgb = time.perf_counter()
     output_rgb = soft_gamut_compress(lab_to_rgb(output_lab))
+    timings["output_rgb"] = time.perf_counter() - t_rgb
 
     # Compute aligned difference map for UI visualization ONLY
+    t_debug = time.perf_counter()
     ref_rgb = global_metrics["tensors"]["reference_resized_rgb"]
     import cv2
     ref_L_full = ((reference_resized_lab[0, 0].detach().cpu().numpy() / 100.0) * 255).clip(0, 255).astype(np.uint8)
@@ -688,9 +691,10 @@ def run_bilateral_transfer(
     output_rgb_np = to_hwc_np(output_rgb)
     base_rgb_np = to_hwc_np(base_intermediate_rgb)
     edit_map = np.clip(np.abs(output_rgb_np - base_rgb_np) * edit_mask, 0.0, 1.0).astype(np.float32)
+    timings["debug_visualization"] = time.perf_counter() - t_debug
 
     # ---- Save outputs and debug images ----
-    t6 = time.perf_counter()
+    t6_grid = time.perf_counter()
     paths = dict(global_metrics.get("paths", {}))
     paths.update({
         "grid_viewport": str(output_dir / "grid_viewport.png"),
@@ -701,13 +705,17 @@ def run_bilateral_transfer(
     })
 
     save_rgb(paths["grid_viewport"], _grid_viewport(grid))
+    timings["save_grid_debug"] = time.perf_counter() - t6_grid
+
+    t6_final = time.perf_counter()
     save_rgb(paths["final_output"], to_hwc_np(output_rgb))
+    timings["save_final_output"] = time.perf_counter() - t6_final
     
     from PIL import Image as _PILImage
+    t6_debug = time.perf_counter()
     save_rgb(paths["edit_map"], edit_map)
     _PILImage.fromarray(diff_heatmap).save(paths["diff_map"])
-
-    timings["save_debug"] = time.perf_counter() - t6
+    timings["save_aux_debug"] = time.perf_counter() - t6_debug
 
     final_stats = image_stats_from_lab(source_lab, output_lab, output_rgb)
 
