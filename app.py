@@ -164,11 +164,6 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
 
 
 css = """
-.pipeline-stage {
-    margin: 0;
-    padding: 0;
-}
-
 .pipeline-stage-title {
     margin: 0 0 6px;
     font-size: 1.15rem;
@@ -240,54 +235,58 @@ def build_app() -> gr.Blocks:
         gr.Markdown("## Debug Pipeline")
 
         with gr.Column():
-            with gr.Group(elem_classes="pipeline-stage"):
-                gr.HTML("<div class='pipeline-stage-title'>Alignment</div>")
-                v4_lightglue = gr.Image(
-                    label="LightGlue matches",
+            # The stage labels are plain text; the images themselves stay unboxed
+            # so the layout reads as a vertical pipeline rather than separate cards.
+            gr.HTML("<div class='pipeline-stage-title'>Alignment</div>")
+            v4_lightglue = gr.Image(
+                label="LightGlue matches",
+                type="filepath",
+                elem_classes="stage-image",
+                container=False,
+            )
+
+            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+
+            gr.HTML("<div class='pipeline-stage-title'>Neural Preset</div>")
+            v4_base = gr.Image(
+                label="Base intermediate (after Neural Preset)",
+                type="filepath",
+                elem_classes="stage-image",
+                container=False,
+            )
+
+            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+
+            gr.HTML("<div class='pipeline-stage-title'>Bilateral Grid</div>")
+            with gr.Row(elem_classes="debug-row"):
+                v4_grid = gr.Image(
+                    label="Bilateral grid viewport",
                     type="filepath",
                     elem_classes="stage-image",
+                    container=False,
+                )
+                v4_ref = gr.Image(
+                    label="Bilateral Transfer Edit Map",
+                    type="filepath",
+                    elem_classes="stage-image",
+                    container=False,
+                )
+                v4_diff = gr.Image(
+                    label="Difference Map (Output vs Aligned Reference)",
+                    type="filepath",
+                    elem_classes="stage-image",
+                    container=False,
                 )
 
             gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
 
-            with gr.Group(elem_classes="pipeline-stage"):
-                gr.HTML("<div class='pipeline-stage-title'>Neural Preset</div>")
-                v4_base = gr.Image(
-                    label="Base intermediate (after Neural Preset)",
-                    type="filepath",
-                    elem_classes="stage-image",
-                )
-
-            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
-
-            with gr.Group(elem_classes="pipeline-stage"):
-                gr.HTML("<div class='pipeline-stage-title'>Bilateral Grid</div>")
-                with gr.Row(elem_classes="debug-row"):
-                    v4_grid = gr.Image(
-                        label="Bilateral grid viewport",
-                        type="filepath",
-                        elem_classes="stage-image",
-                    )
-                    v4_ref = gr.Image(
-                        label="Bilateral Transfer Edit Map",
-                        type="filepath",
-                        elem_classes="stage-image",
-                    )
-                    v4_diff = gr.Image(
-                        label="Difference Map (Output vs Aligned Reference)",
-                        type="filepath",
-                        elem_classes="stage-image",
-                    )
-
-            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
-
-            with gr.Group(elem_classes="pipeline-stage"):
-                gr.HTML("<div class='pipeline-stage-title'>Final Output</div>")
-                v4_final = gr.Image(
-                    label="V0.4.5 Final output",
-                    type="filepath",
-                    elem_classes="stage-image",
-                )
+            gr.HTML("<div class='pipeline-stage-title'>Final Output</div>")
+            v4_final = gr.Image(
+                label="V0.4.5 Final output",
+                type="filepath",
+                elem_classes="stage-image",
+                container=False,
+            )
 
         run_v040_btn.click(
             fn=run_v040,
