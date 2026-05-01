@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Generator, Optional, Tuple
+import time
 
 import gradio as gr
 from PIL import Image
@@ -124,12 +125,36 @@ def choose_input(path: Optional[str], default: Path, label: str) -> str:
     raise gr.Error(f"Please upload a {label} image.")
 
 
-def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple[str, ...]:
+def format_arrow_time(label: str, seconds: Optional[float]) -> str:
+    if seconds is None:
+        return f"<div class='pipeline-arrow-line'><span class='pipeline-arrow-symbol'>&darr;</span><span class='pipeline-arrow-time'>{label}</span></div>"
+    return f"<div class='pipeline-arrow-line'><span class='pipeline-arrow-symbol'>&darr;</span><span class='pipeline-arrow-time'>{label} {seconds:.2f}s</span></div>"
+
+
+def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Generator[Tuple[object, ...], None, None]:
     source = choose_input(source_path, DEFAULT_SOURCE, "source")
     reference = choose_input(reference_path, DEFAULT_REFERENCE, "reference")
     run_dir = OUTPUTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "v040"
 
+    lightglue_started = time.perf_counter()
     alignment = run_lightglue_alignment(source, reference, run_dir, LightGlueAlignmentConfig())
+    lightglue_seconds = time.perf_counter() - lightglue_started
+
+    lightglue_path = alignment["paths"].get("lightglue_matches", "")
+    yield (
+        lightglue_path,
+        None,
+        None,
+        None,
+        None,
+        None,
+        format_arrow_time("LightGlue", lightglue_seconds),
+        format_arrow_time("Neural Preset", None),
+        format_arrow_time("Bilateral Grid", None),
+        format_arrow_time("Final Output", None),
+    )
+
+    neural_started = time.perf_counter()
     global_metrics = run_global_matching(
         source,
         reference,
@@ -140,7 +165,23 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
         extra_paths=alignment["paths"],
         extra_metrics={"lightglue_alignment": alignment["metrics"]},
     )
+    neural_seconds = global_metrics["timings"].get("neural_preset_inference", time.perf_counter() - neural_started)
     tensors = global_metrics["tensors"]
+    base_path = global_metrics["paths"]["base_intermediate"]
+    yield (
+        lightglue_path,
+        base_path,
+        None,
+        None,
+        None,
+        None,
+        format_arrow_time("LightGlue", lightglue_seconds),
+        format_arrow_time("Neural Preset", neural_seconds),
+        format_arrow_time("Bilateral Grid", None),
+        format_arrow_time("Final Output", None),
+    )
+
+    bilateral_started = time.perf_counter()
     metrics = run_bilateral_transfer(
         base_intermediate_lab=tensors["base_intermediate_lab"],
         base_intermediate_rgb=tensors["base_intermediate_rgb"],
@@ -152,31 +193,50 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Tuple
         global_metrics=global_metrics,
         config=BilateralTransferConfig(),
     )
+    bilateral_seconds = time.perf_counter() - bilateral_started
     paths = metrics["paths"]
-    return (
-        paths.get("lightglue_matches", ""),
-        paths["base_intermediate"],
+    save_seconds = float(metrics["timings"].get("save_debug", 0.0))
+    bilateral_compute_seconds = max(bilateral_seconds - save_seconds, 0.0)
+    yield (
+        lightglue_path,
+        base_path,
         paths["grid_viewport"],
-        paths["final_output"],
         paths.get("edit_map", ""),
         paths.get("diff_map", ""),
+        paths["final_output"],
+        format_arrow_time("LightGlue", lightglue_seconds),
+        format_arrow_time("Neural Preset", neural_seconds),
+        format_arrow_time("Bilateral Grid", bilateral_compute_seconds),
+        format_arrow_time("Final Output", save_seconds),
     )
 
 
 css = """
-.pipeline-stage-title {
-    margin: 0 0 6px;
-    font-size: 1.15rem;
-    font-weight: 600;
-    color: #1e293b;
+.pipeline-arrow-row {
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin: 2px 0 8px;
 }
 
-.pipeline-arrow {
-    text-align: center;
+.pipeline-arrow-line {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    color: #ffffff;
+    width: 100%;
+}
+
+.pipeline-arrow-symbol {
     font-size: 28px;
     line-height: 1;
-    color: #64748b;
-    margin: 2px 0 8px;
+}
+
+.pipeline-arrow-time {
+    font-size: 0.95rem;
+    font-weight: 500;
+    white-space: nowrap;
 }
 
 .debug-row {
@@ -235,9 +295,8 @@ def build_app() -> gr.Blocks:
         gr.Markdown("## Debug Pipeline")
 
         with gr.Column():
-            # The stage labels are plain text; the images themselves stay unboxed
-            # so the layout reads as a vertical pipeline rather than separate cards.
-            gr.HTML("<div class='pipeline-stage-title'>Alignment</div>")
+            with gr.Row(elem_classes="pipeline-arrow-row"):
+                arrow_lightglue = gr.HTML(value=format_arrow_time("LightGlue", None))
             v4_lightglue = gr.Image(
                 label="LightGlue matches",
                 type="filepath",
@@ -245,9 +304,9 @@ def build_app() -> gr.Blocks:
                 container=False,
             )
 
-            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+            with gr.Row(elem_classes="pipeline-arrow-row"):
+                arrow_neural = gr.HTML(value=format_arrow_time("Neural Preset", None))
 
-            gr.HTML("<div class='pipeline-stage-title'>Neural Preset</div>")
             v4_base = gr.Image(
                 label="Base intermediate (after Neural Preset)",
                 type="filepath",
@@ -255,9 +314,9 @@ def build_app() -> gr.Blocks:
                 container=False,
             )
 
-            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+            with gr.Row(elem_classes="pipeline-arrow-row"):
+                arrow_bilateral = gr.HTML(value=format_arrow_time("Bilateral Grid", None))
 
-            gr.HTML("<div class='pipeline-stage-title'>Bilateral Grid</div>")
             with gr.Row(elem_classes="debug-row"):
                 v4_grid = gr.Image(
                     label="Bilateral grid viewport",
@@ -278,9 +337,9 @@ def build_app() -> gr.Blocks:
                     container=False,
                 )
 
-            gr.HTML("<div class='pipeline-arrow' aria-hidden='true'>&darr;</div>")
+            with gr.Row(elem_classes="pipeline-arrow-row"):
+                arrow_final = gr.HTML(value=format_arrow_time("Final Output", None))
 
-            gr.HTML("<div class='pipeline-stage-title'>Final Output</div>")
             v4_final = gr.Image(
                 label="V0.4.5 Final output",
                 type="filepath",
@@ -291,7 +350,18 @@ def build_app() -> gr.Blocks:
         run_v040_btn.click(
             fn=run_v040,
             inputs=[source_image, reference_image],
-            outputs=[v4_lightglue, v4_base, v4_grid, v4_final, v4_ref, v4_diff],
+            outputs=[
+                v4_lightglue,
+                v4_base,
+                v4_grid,
+                v4_ref,
+                v4_diff,
+                v4_final,
+                arrow_lightglue,
+                arrow_neural,
+                arrow_bilateral,
+                arrow_final,
+            ],
             queue=True,
         )
 
