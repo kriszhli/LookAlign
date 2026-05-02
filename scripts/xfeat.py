@@ -314,16 +314,20 @@ class XFeat(nn.Module):
 
 @dataclass
 class XFeatAlignmentConfig:
-    max_long_edge: int = 640
-    top_k: int = 512
+    max_long_edge: int = 1536
+    top_k: int = 4096
     detection_threshold: float = 0.05
-    multiscale: bool = False
+    multiscale: bool = True
     min_inlier_count: int = 24
     ransac_threshold: float = 3.0
-    max_matches_drawn: int = 80
+    max_matches_drawn: int = 1000
     max_mean_reprojection_error: float = 4.0
     min_overlap_ratio: float = 0.55
     max_corner_shift_ratio: float = 0.35
+    mesh_grid_size: int = 128
+    mesh_sigma: float = 0.18
+    mesh_strength: float = 1.0
+    mesh_max_offset_ratio: float = 0.06
     device: str = "auto"
     weights_path: str = str(Path(__file__).resolve().parents[1] / "ckpts" / "xfeat.pt")
 
@@ -354,6 +358,7 @@ def _cache_file_path(source_path: str | Path, reference_path: str | Path, cfg: X
     reference_fp = _file_fingerprint(reference_path)
     weights_fp = _file_fingerprint(cfg.weights_path)
     key = {
+        "version": 5,
         "source_fp": source_fp,
         "reference_fp": reference_fp,
         "weights_fp": weights_fp,
@@ -362,6 +367,10 @@ def _cache_file_path(source_path: str | Path, reference_path: str | Path, cfg: X
         "detection_threshold": float(cfg.detection_threshold),
         "multiscale": bool(cfg.multiscale),
         "ransac_threshold": float(cfg.ransac_threshold),
+        "mesh_grid_size": int(cfg.mesh_grid_size),
+        "mesh_sigma": float(cfg.mesh_sigma),
+        "mesh_strength": float(cfg.mesh_strength),
+        "mesh_max_offset_ratio": float(cfg.mesh_max_offset_ratio),
     }
     digest = hashlib.sha1(repr(sorted(key.items())).encode("utf-8")).hexdigest()
     root = Path(__file__).resolve().parents[1]
@@ -428,14 +437,46 @@ def _draw_match_overlay(
     if order.size > max_matches:
         order = order[np.linspace(0, order.size - 1, num=max_matches, dtype=int)]
     offset_x = src_disp.shape[1]
+    overlay_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay_layer)
     for idx in order:
         p0_xy = np.round(src_pts[idx] * src_scale).astype(int)
         p1_xy = np.round(ref_pts[idx] * ref_scale).astype(int) + np.array([offset_x, 0])
         p0 = tuple(p0_xy.tolist())
         p1 = tuple(p1_xy.tolist())
-        draw.line((p0[0], p0[1], p1[0], p1[1]), fill=(80, 255, 120), width=1)
-        draw.ellipse((p0[0] - 2, p0[1] - 2, p0[0] + 2, p0[1] + 2), fill=(255, 255, 0))
-        draw.ellipse((p1[0] - 2, p1[1] - 2, p1[0] + 2, p1[1] + 2), fill=(255, 255, 0))
+        overlay_draw.line((p0[0], p0[1], p1[0], p1[1]), fill=(80, 255, 120, 80), width=1)
+        overlay_draw.ellipse((p0[0] - 1, p0[1] - 1, p0[0] + 1, p0[1] + 1), fill=(255, 255, 0, 150))
+        overlay_draw.ellipse((p1[0] - 1, p1[1] - 1, p1[0] + 1, p1[1] + 1), fill=(255, 255, 0, 150))
+    
+    img = Image.alpha_composite(img.convert("RGBA"), overlay_layer).convert("RGB")
+    return np.asarray(img).astype(np.float32) / 255.0
+
+
+def _draw_aligned_stack(source_rgb: np.ndarray, reference_rgb: np.ndarray, target_h: int = 720) -> np.ndarray:
+    src = (np.clip(source_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    ref = (np.clip(reference_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+    height, width = source_rgb.shape[:2]
+    if reference_rgb.shape[:2] != (height, width):
+        ref = cv2.resize(ref, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    scale = target_h / max(height, 1)
+    disp_h = max(64, min(int(round(height * scale)), target_h))
+    disp_w = max(1, int(round(width * (disp_h / max(height, 1)))))
+    src_disp = cv2.resize(src, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+    ref_disp = cv2.resize(ref, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+
+    overlay = np.empty_like(src_disp)
+    overlay[..., 0] = src_disp[..., 0]
+    overlay[..., 1] = ref_disp[..., 1]
+    overlay[..., 2] = ref_disp[..., 2]
+
+    canvas = np.zeros((disp_h + 26, disp_w, 3), dtype=np.uint8)
+    canvas[26:] = overlay
+    img = Image.fromarray(canvas, mode="RGB")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((0, 0, disp_w, 26), fill=(0, 0, 0))
+    draw.text((8, 6), "Spatial stack: source (R) + aligned reference (GB)", fill=(255, 255, 255))
     return np.asarray(img).astype(np.float32) / 255.0
 
 
@@ -467,11 +508,17 @@ def _largest_valid_rect(mask: np.ndarray) -> tuple[int, int, int, int]:
 
 def _fallback_alignment(source_rgb: np.ndarray, reference_rgb: np.ndarray, match_path: Path, reason: str) -> Dict[str, Any]:
     overlay = _draw_match_overlay(source_rgb, reference_rgb, np.empty((0, 2)), np.empty((0, 2)), np.zeros(0), 0, fallback_text=reason)
+    aligned_stack = _draw_aligned_stack(source_rgb, reference_rgb)
+    aligned_path = match_path.with_name("xfeat_aligned_stack.png")
     _save_rgb(match_path, overlay)
+    _save_rgb(aligned_path, aligned_stack)
     return {
         "source_rgb": source_rgb,
         "reference_rgb": reference_rgb,
-        "paths": {"xfeat_matches": str(match_path)},
+        "paths": {
+            "xfeat_matches": str(match_path),
+            "xfeat_aligned_stack": str(aligned_path),
+        },
         "metrics": {
             "status": "fallback",
             "reason": reason,
@@ -484,12 +531,14 @@ def _fallback_alignment(source_rgb: np.ndarray, reference_rgb: np.ndarray, match
     }
 
 
-def _homography_is_usable(
+def _global_warp_is_usable(
     H: np.ndarray,
     src_pts: np.ndarray,
     ref_pts: np.ndarray,
     inlier_mask: np.ndarray,
     source_shape: tuple[int, int, int],
+    reference_shape: tuple[int, int, int],
+    src_scale: float,
     cfg: XFeatAlignmentConfig,
 ) -> tuple[bool, Dict[str, float]]:
     inlier_src = src_pts[inlier_mask]
@@ -502,7 +551,8 @@ def _homography_is_usable(
     mean_reproj = float(reproj.mean())
 
     src_h, src_w = source_shape[:2]
-    ref_corners = np.array([[0, 0], [0, src_h - 1], [src_w - 1, src_h - 1], [src_w - 1, 0]], dtype=np.float32).reshape(-1, 1, 2)
+    ref_h, ref_w = reference_shape[:2]
+    ref_corners = np.array([[0, 0], [0, ref_h - 1], [ref_w - 1, ref_h - 1], [ref_w - 1, 0]], dtype=np.float32).reshape(-1, 1, 2)
     warped = cv2.perspectiveTransform(ref_corners, H).reshape(-1, 2)
     x0, y0 = warped.min(axis=0)
     x1, y1 = warped.max(axis=0)
@@ -510,12 +560,12 @@ def _homography_is_usable(
     inter_h = max(0.0, min(float(src_h), float(y1)) - max(0.0, float(y0)))
     overlap_ratio = float((inter_w * inter_h) / max(float(src_w * src_h), 1.0))
 
-    src_corners = ref_corners.reshape(-1, 2)
+    src_corners = np.array([[0, 0], [0, src_h - 1], [src_w - 1, src_h - 1], [src_w - 1, 0]], dtype=np.float32)
     corner_shift = np.linalg.norm(warped - src_corners, axis=1).mean()
     corner_shift_ratio = float(corner_shift / max(float((src_w**2 + src_h**2) ** 0.5), 1.0))
 
     usable = (
-        mean_reproj <= cfg.max_mean_reprojection_error
+        (mean_reproj * src_scale) <= cfg.max_mean_reprojection_error
         and overlap_ratio >= cfg.min_overlap_ratio
         and corner_shift_ratio <= cfg.max_corner_shift_ratio
     )
@@ -524,6 +574,83 @@ def _homography_is_usable(
         "overlap_ratio": overlap_ratio,
         "corner_shift_ratio": corner_shift_ratio,
     }
+
+
+def _build_mesh_residual_field(
+    src_pts: np.ndarray,
+    ref_pts: np.ndarray,
+    inlier_mask: np.ndarray,
+    H: np.ndarray,
+    out_h: int,
+    out_w: int,
+    cfg: XFeatAlignmentConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    inlier_src = src_pts[inlier_mask].astype(np.float32)
+    inlier_ref = ref_pts[inlier_mask].astype(np.float32)
+    if inlier_src.shape[0] == 0:
+        zero = np.zeros((out_h, out_w), dtype=np.float32)
+        return zero, zero
+
+    projected = cv2.perspectiveTransform(inlier_ref.reshape(-1, 1, 2), H).reshape(-1, 2)
+    residual = (inlier_src - projected).astype(np.float32)
+    diag = max(float((out_w**2 + out_h**2) ** 0.5), 1.0)
+    max_offset = float(cfg.mesh_max_offset_ratio) * diag
+    residual = np.clip(residual, -max_offset, max_offset) * float(cfg.mesh_strength)
+
+    grid_size = max(8, int(cfg.mesh_grid_size))
+    yy = np.linspace(0.0, out_h - 1.0, grid_size, dtype=np.float32)
+    xx = np.linspace(0.0, out_w - 1.0, grid_size, dtype=np.float32)
+    mesh_x, mesh_y = np.meshgrid(xx, yy)
+    query = np.stack([mesh_x.reshape(-1), mesh_y.reshape(-1)], axis=1)
+
+    sigma_px = max(float(cfg.mesh_sigma) * diag, 1.0)
+    diff = query[:, None, :] - inlier_src[None, :, :]
+    dist2 = np.sum(diff * diff, axis=2)
+    gauss_weights = np.exp(-0.5 * dist2 / (sigma_px * sigma_px)).astype(np.float32)
+    
+    idw_weights = gauss_weights / np.maximum(dist2, 1e-4)
+    weights_sum = np.maximum(idw_weights.sum(axis=1, keepdims=True), 1e-8)
+    mesh_residual = (idw_weights @ residual) / weights_sum
+    
+    envelope = np.clip(gauss_weights.max(axis=1, keepdims=True) * 5.0, 0.0, 1.0)
+    mesh_residual = mesh_residual * envelope
+
+    field_x = cv2.resize(mesh_residual[:, 0].reshape(grid_size, grid_size), (out_w, out_h), interpolation=cv2.INTER_CUBIC)
+    field_y = cv2.resize(mesh_residual[:, 1].reshape(grid_size, grid_size), (out_w, out_h), interpolation=cv2.INTER_CUBIC)
+    return field_x.astype(np.float32), field_y.astype(np.float32)
+
+
+def _warp_reference_locally(
+    reference_rgb: np.ndarray,
+    H: np.ndarray,
+    src_pts: np.ndarray,
+    ref_pts: np.ndarray,
+    inlier_mask: np.ndarray,
+    out_h: int,
+    out_w: int,
+    cfg: XFeatAlignmentConfig,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    global_ref = cv2.warpPerspective(reference_rgb.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+    global_mask = cv2.warpPerspective(
+        np.ones(reference_rgb.shape[:2], dtype=np.uint8),
+        H,
+        (out_w, out_h),
+        flags=cv2.INTER_NEAREST,
+    ).astype(np.float32)
+
+    field_x, field_y = _build_mesh_residual_field(src_pts, ref_pts, inlier_mask, H, out_h, out_w, cfg)
+    yy, xx = np.meshgrid(np.arange(out_h, dtype=np.float32), np.arange(out_w, dtype=np.float32), indexing="ij")
+    remap_x = xx - field_x
+    remap_y = yy - field_y
+
+    warped_ref = cv2.remap(global_ref, remap_x, remap_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    warped_mask = cv2.remap(global_mask, remap_x, remap_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    mesh_offset = np.sqrt(field_x * field_x + field_y * field_y)
+    mesh_stats = {
+        "mesh_mean_offset": float(mesh_offset.mean()),
+        "mesh_max_offset": float(mesh_offset.max()),
+    }
+    return warped_ref, warped_mask, mesh_stats
 
 
 @lru_cache(maxsize=4)
@@ -543,12 +670,14 @@ def run_xfeat_alignment(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     match_path = output_dir / "xfeat_matches.png"
+    aligned_path = output_dir / "xfeat_aligned_stack.png"
     cache_path = _cache_file_path(source_path, reference_path, cfg)
 
     source_fp = _file_fingerprint(source_path)
     reference_fp = _file_fingerprint(reference_path)
     weights_fp = _file_fingerprint(cfg.weights_path)
     cache_key = {
+        "version": 5,
         "source_fp": source_fp,
         "reference_fp": reference_fp,
         "weights_fp": weights_fp,
@@ -557,6 +686,10 @@ def run_xfeat_alignment(
         "detection_threshold": float(cfg.detection_threshold),
         "multiscale": bool(cfg.multiscale),
         "ransac_threshold": float(cfg.ransac_threshold),
+        "mesh_grid_size": int(cfg.mesh_grid_size),
+        "mesh_sigma": float(cfg.mesh_sigma),
+        "mesh_strength": float(cfg.mesh_strength),
+        "mesh_max_offset_ratio": float(cfg.mesh_max_offset_ratio),
     }
 
     if cache_path.exists():
@@ -571,10 +704,18 @@ def run_xfeat_alignment(
                 else:
                     overlay = overlay_raw.astype(np.float32)
                 _save_rgb(match_path, overlay)
+                aligned_stack = _draw_aligned_stack(
+                    cached["source_rgb"].astype(np.float32),
+                    cached["reference_rgb"].astype(np.float32),
+                )
+                _save_rgb(aligned_path, aligned_stack)
                 return {
                     "source_rgb": cached["source_rgb"].astype(np.float32),
                     "reference_rgb": cached["reference_rgb"].astype(np.float32),
-                    "paths": {"xfeat_matches": str(match_path)},
+                    "paths": {
+                        "xfeat_matches": str(match_path),
+                        "xfeat_aligned_stack": str(aligned_path),
+                    },
                     "metrics": {**cached["metrics"].item(), "cache_hit": True},
                 }
         except Exception:
@@ -602,7 +743,8 @@ def run_xfeat_alignment(
     src_pts = src_pts_small / max(src_scale, 1e-8)
     ref_pts = ref_pts_small / max(ref_scale, 1e-8)
 
-    H, inlier_mask = cv2.findHomography(ref_pts.astype(np.float32), src_pts.astype(np.float32), cv2.RANSAC, cfg.ransac_threshold)
+    actual_ransac_thresh = cfg.ransac_threshold / max(src_scale, 1e-8)
+    H, inlier_mask = cv2.findHomography(ref_pts.astype(np.float32), src_pts.astype(np.float32), cv2.RANSAC, actual_ransac_thresh)
     if H is None or inlier_mask is None:
         result = _fallback_alignment(source_rgb, reference_rgb, match_path, "XFeat* fallback: homography failed")
         result["metrics"]["cache_hit"] = False
@@ -615,20 +757,29 @@ def run_xfeat_alignment(
         result["metrics"]["cache_hit"] = False
         return result
 
-    usable, quality = _homography_is_usable(H, src_pts, ref_pts, inlier_mask, source_rgb.shape, cfg)
+    usable, quality = _global_warp_is_usable(H, src_pts, ref_pts, inlier_mask, source_rgb.shape, reference_rgb.shape, src_scale, cfg)
     if not usable:
         result = _fallback_alignment(source_rgb, reference_rgb, match_path, "XFeat* fallback: unstable homography")
         result["metrics"]["cache_hit"] = False
         return result
 
+    F_mat, inlier_mask_F = cv2.findFundamentalMat(ref_pts.astype(np.float32), src_pts.astype(np.float32), cv2.FM_RANSAC, actual_ransac_thresh)
+    if F_mat is not None and inlier_mask_F is not None:
+        mesh_inlier_mask = inlier_mask_F.reshape(-1).astype(bool)
+    else:
+        mesh_inlier_mask = inlier_mask.reshape(-1).astype(bool)
+
     src_h, src_w = source_rgb.shape[:2]
-    warped_ref = cv2.warpPerspective(reference_rgb.astype(np.float32), H, (src_w, src_h), flags=cv2.INTER_LINEAR)
-    valid_mask = cv2.warpPerspective(
-        np.ones(reference_rgb.shape[:2], dtype=np.uint8),
+    warped_ref, valid_mask, mesh_stats = _warp_reference_locally(
+        reference_rgb,
         H,
-        (src_w, src_h),
-        flags=cv2.INTER_NEAREST,
-    ).astype(bool)
+        src_pts,
+        ref_pts,
+        mesh_inlier_mask,
+        src_h,
+        src_w,
+        cfg,
+    )
 
     x, y, w, h = _largest_valid_rect(valid_mask)
     if w < 16 or h < 16:
@@ -638,13 +789,18 @@ def run_xfeat_alignment(
 
     source_crop = source_rgb[y : y + h, x : x + w].copy()
     ref_crop = warped_ref[y : y + h, x : x + w].copy()
-    overlay = _draw_match_overlay(source_rgb, reference_rgb, src_pts, ref_pts, inlier_mask, cfg.max_matches_drawn)
+    overlay = _draw_match_overlay(source_rgb, reference_rgb, src_pts, ref_pts, mesh_inlier_mask, cfg.max_matches_drawn)
+    aligned_stack = _draw_aligned_stack(source_crop, ref_crop)
     _save_rgb(match_path, overlay)
+    _save_rgb(aligned_path, aligned_stack)
 
     result = {
         "source_rgb": source_crop,
         "reference_rgb": ref_crop,
-        "paths": {"xfeat_matches": str(match_path)},
+        "paths": {
+            "xfeat_matches": str(match_path),
+            "xfeat_aligned_stack": str(aligned_path),
+        },
         "metrics": {
             "status": "ok",
             "reason": "",
@@ -654,8 +810,10 @@ def run_xfeat_alignment(
             "crop_bounds": [int(x), int(y), int(w), int(h)],
             "aligned_shape": [int(h), int(w), 3],
             "homography": H.tolist(),
+            "warp_mode": "mesh_local_warp",
             "cache_hit": False,
             **quality,
+            **mesh_stats,
         },
     }
     np.savez(
