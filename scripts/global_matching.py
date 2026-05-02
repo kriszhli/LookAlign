@@ -392,7 +392,10 @@ def run_global_matching(
     reference_np = reference_rgb_np if reference_rgb_np is not None else load_rgb(reference_path)
     source = to_nchw(source_np, device)
     reference = to_nchw(reference_np, device)
-    reference_resized = resize_to_hw(reference, source.shape[2], source.shape[3])
+    if reference.shape[2:] == source.shape[2:]:
+        reference_resized = reference.clone()
+    else:
+        reference_resized = resize_to_hw(reference, source.shape[2], source.shape[3])
     source_fit = resize_long_edge(source, cfg.fit_long_edge)
     timings["load_and_resize"] = time.perf_counter() - t0
 
