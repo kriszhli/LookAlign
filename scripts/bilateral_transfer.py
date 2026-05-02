@@ -639,35 +639,11 @@ def run_bilateral_transfer(
     output_rgb = soft_gamut_compress(lab_to_rgb(output_lab))
     timings["output_rgb"] = time.perf_counter() - t_rgb
 
-    # Compute aligned difference map for UI visualization ONLY
+    # Difference map uses the already aligned reference from global_matching.
     t_debug = time.perf_counter()
-    ref_rgb = global_metrics["tensors"]["reference_resized_rgb"]
-    import cv2
-    ref_L_full = ((reference_resized_lab[0, 0].detach().cpu().numpy() / 100.0) * 255).clip(0, 255).astype(np.uint8)
-    out_L_full = ((output_lab[0, 0].detach().cpu().numpy() / 100.0) * 255).clip(0, 255).astype(np.uint8)
-    inst = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-    flow_full = inst.calc(ref_L_full, out_L_full, None)
-    
-    fh, fw = out_L_full.shape
-    map_x_f = np.tile(np.arange(fw), (fh, 1)).astype(np.float32) + flow_full[..., 0]
-    map_y_f = np.repeat(np.arange(fh), fw).reshape(fh, fw).astype(np.float32) + flow_full[..., 1]
-    
-    ref_rgb_np = ref_rgb[0].permute(1, 2, 0).detach().cpu().numpy()
-    ref_rgb_warped_np = cv2.remap(ref_rgb_np, map_x_f, map_y_f, cv2.INTER_LINEAR)
-    ref_rgb_warped = torch.from_numpy(ref_rgb_warped_np).permute(2, 0, 1).unsqueeze(0).to(ref_rgb.device)
-
-    ref_lab_warped = torch.from_numpy(
-        cv2.remap(
-            reference_resized_lab[0].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32),
-            map_x_f,
-            map_y_f,
-            cv2.INTER_LINEAR,
-        )
-    ).permute(2, 0, 1).unsqueeze(0).to(output_lab.device, dtype=output_lab.dtype)
-
     out_chroma = output_lab[:, 1:3].norm(dim=1)
-    ref_chroma = ref_lab_warped[:, 1:3].norm(dim=1)
-    delta_l = (output_lab[:, 0] - ref_lab_warped[:, 0]) / 100.0
+    ref_chroma = reference_resized_lab[:, 1:3].norm(dim=1)
+    delta_l = (output_lab[:, 0] - reference_resized_lab[:, 0]) / 100.0
     delta_c = (out_chroma - ref_chroma) / 100.0
     signed_score = (0.65 * delta_l + 0.35 * delta_c).squeeze(0).detach().cpu().numpy()
     magnitude = (0.85 * np.abs(delta_l.squeeze(0).detach().cpu().numpy()) + 0.15 * np.abs(delta_c.squeeze(0).detach().cpu().numpy()))
