@@ -5,35 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
+from skimage.transform import PiecewiseAffineTransform
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 Tensor = torch.Tensor
-
-
-class InterpolateSparse2d(nn.Module):
-    """Interpolate a feature map at sparse 2D positions."""
-
-    def __init__(self, mode: str = "bicubic") -> None:
-        super().__init__()
-        self.mode = mode
-
-    def normgrid(self, x: Tensor, height: int, width: int) -> Tensor:
-        scale = torch.tensor([max(width - 1, 1), max(height - 1, 1)], device=x.device, dtype=x.dtype)
-        return 2.0 * (x / scale) - 1.0
-
-    def forward(self, x: Tensor, pos: Tensor, height: int, width: int) -> Tensor:
-        grid = self.normgrid(pos, height, width).unsqueeze(-2).to(x.dtype)
-        sampled = F.grid_sample(x, grid, mode=self.mode, align_corners=False)
-        return sampled.permute(0, 2, 3, 1).squeeze(-2)
 
 
 class BasicLayer(nn.Module):
@@ -158,9 +143,6 @@ class XFeat(nn.Module):
         self.detection_threshold = detection_threshold
         state = torch.load(weights, map_location=self.dev, weights_only=True)
         self.net.load_state_dict(state)
-        self.interpolator = InterpolateSparse2d("bicubic")
-        self.nearest = InterpolateSparse2d("nearest")
-        self.bilinear = InterpolateSparse2d("bilinear")
 
     @torch.inference_mode()
     def match_xfeat_star(
@@ -203,25 +185,6 @@ class XFeat(nn.Module):
         rw = width / aligned_w
         x = F.interpolate(x, (aligned_h, aligned_w), mode="bilinear", align_corners=False)
         return x, rh, rw
-
-    def get_kpts_heatmap(self, kpts: Tensor, softmax_temp: float = 1.0) -> Tensor:
-        scores = F.softmax(kpts * softmax_temp, 1)[:, :64]
-        batch, _, height, width = scores.shape
-        heatmap = scores.permute(0, 2, 3, 1).reshape(batch, height, width, 8, 8)
-        heatmap = heatmap.permute(0, 1, 3, 2, 4).reshape(batch, 1, height * 8, width * 8)
-        return heatmap
-
-    def nms(self, x: Tensor, threshold: float = 0.05, kernel_size: int = 5) -> Tensor:
-        batch, _, _, _ = x.shape
-        pad = kernel_size // 2
-        local_max = nn.MaxPool2d(kernel_size=kernel_size, stride=1, padding=pad)(x)
-        pos = (x == local_max) & (x > threshold)
-        pos_batched = [k.nonzero()[..., 1:].flip(-1) for k in pos]
-        pad_val = max(len(points) for points in pos_batched)
-        out = torch.zeros((batch, pad_val, 2), dtype=torch.long, device=x.device)
-        for idx, points in enumerate(pos_batched):
-            out[idx, : len(points), :] = points
-        return out
 
     def create_xy(self, height: int, width: int, dev: torch.device) -> Tensor:
         yy, xx = torch.meshgrid(torch.arange(height, device=dev), torch.arange(width, device=dev), indexing="ij")
@@ -324,10 +287,6 @@ class XFeatAlignmentConfig:
     max_mean_reprojection_error: float = 4.0
     min_overlap_ratio: float = 0.55
     max_corner_shift_ratio: float = 0.35
-    mesh_grid_size: int = 128
-    mesh_sigma: float = 0.18
-    mesh_strength: float = 1.0
-    mesh_max_offset_ratio: float = 0.06
     device: str = "auto"
     weights_path: str = str(Path(__file__).resolve().parents[1] / "ckpts" / "xfeat.pt")
 
@@ -358,7 +317,6 @@ def _cache_file_path(source_path: str | Path, reference_path: str | Path, cfg: X
     reference_fp = _file_fingerprint(reference_path)
     weights_fp = _file_fingerprint(cfg.weights_path)
     key = {
-        "version": 7,
         "source_fp": source_fp,
         "reference_fp": reference_fp,
         "weights_fp": weights_fp,
@@ -367,10 +325,7 @@ def _cache_file_path(source_path: str | Path, reference_path: str | Path, cfg: X
         "detection_threshold": float(cfg.detection_threshold),
         "multiscale": bool(cfg.multiscale),
         "ransac_threshold": float(cfg.ransac_threshold),
-        "mesh_grid_size": int(cfg.mesh_grid_size),
-        "mesh_sigma": float(cfg.mesh_sigma),
-        "mesh_strength": float(cfg.mesh_strength),
-        "mesh_max_offset_ratio": float(cfg.mesh_max_offset_ratio),
+        "warp_model": "piecewise_affine_v1",
     }
     digest = hashlib.sha1(repr(sorted(key.items())).encode("utf-8")).hexdigest()
     root = Path(__file__).resolve().parents[1]
@@ -452,32 +407,80 @@ def _draw_match_overlay(
     return np.asarray(img).astype(np.float32) / 255.0
 
 
-def _draw_warp_field(field_x: np.ndarray, field_y: np.ndarray, bg_rgb: Optional[np.ndarray] = None, step: int = 32) -> np.ndarray:
+def _create_edge_overlay(src_disp: np.ndarray, ref_disp: np.ndarray, bg_color: tuple = (15, 20, 30)) -> np.ndarray:
+    src_gray = cv2.cvtColor(src_disp, cv2.COLOR_RGB2GRAY)
+    ref_gray = cv2.cvtColor(ref_disp, cv2.COLOR_RGB2GRAY)
+    
+    src_gray = cv2.GaussianBlur(src_gray, (3, 3), 0)
+    ref_gray = cv2.GaussianBlur(ref_gray, (3, 3), 0)
+    
+    src_edges = cv2.Canny(src_gray, 40, 120)
+    ref_edges = cv2.Canny(ref_gray, 40, 120)
+    
+    kernel = np.ones((2, 2), np.uint8)
+    src_edges = cv2.dilate(src_edges, kernel, iterations=1)
+    ref_edges = cv2.dilate(ref_edges, kernel, iterations=1)
+    
+    overlay = np.full((*src_disp.shape[:2], 3), bg_color, dtype=np.uint8)
+    
+    overlay[src_edges > 0] = [0, 220, 255]
+    overlay[ref_edges > 0] = [255, 0, 150]
+    overlap = (src_edges > 0) & (ref_edges > 0)
+    overlay[overlap] = [255, 255, 255]
+    
+    return overlay
+
+
+def _draw_warp_field(field_x: np.ndarray, field_y: np.ndarray, bg_src: Optional[np.ndarray] = None, bg_ref: Optional[np.ndarray] = None, step: int = 32, target_h: int = 720) -> np.ndarray:
     h, w = field_x.shape
-    if bg_rgb is not None:
-        bg_gray = cv2.cvtColor((np.clip(bg_rgb, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-        img = cv2.cvtColor(bg_gray, cv2.COLOR_GRAY2RGB)
-        img = (img * 0.4 + 153).astype(np.uint8)
+    scale = target_h / max(h, 1)
+    disp_h = max(64, min(int(round(h * scale)), target_h))
+    disp_w = max(1, int(round(w * (disp_h / max(h, 1)))))
+    
+    if bg_src is not None and bg_ref is not None:
+        src = (np.clip(bg_src, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        ref = (np.clip(bg_ref, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        src_disp = cv2.resize(src, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+        ref_disp = cv2.resize(ref, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+        overlay = _create_edge_overlay(src_disp, ref_disp, bg_color=(15, 20, 30))
+        # dark overlay down a bit more so arrows pop
+        overlay = (overlay * 0.5).astype(np.uint8)
     else:
-        img = np.full((h, w, 3), 255, dtype=np.uint8)
+        overlay = np.full((disp_h, disp_w, 3), (15, 20, 30), dtype=np.uint8)
         
-    for y in range(step // 2, h, step):
-        for x in range(step // 2, w, step):
-            dx = field_x[y, x]
-            dy = field_y[y, x]
+    field_x_disp = cv2.resize(field_x, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR) * (disp_w / w)
+    field_y_disp = cv2.resize(field_y, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR) * (disp_h / h)
+    
+    mesh_offset = np.sqrt(field_x**2 + field_y**2)
+    max_val = float(mesh_offset.max()) if mesh_offset.size > 0 else 0.0
+    max_mag = max(max_val, 1e-6)
+    
+    for y in range(step // 2, disp_h, step):
+        for x in range(step // 2, disp_w, step):
+            dx = field_x_disp[y, x]
+            dy = field_y_disp[y, x]
             if abs(dx) < 0.5 and abs(dy) < 0.5:
-                cv2.circle(img, (x, y), 1, (200, 200, 200), -1)
+                cv2.circle(overlay, (x, y), 1, (180, 220, 255), -1)
                 continue
             
-            end = (int(x + dx * 6.0 ), int(y + dy * 6.0 ))
-            cv2.arrowedLine(img, (x, y), end, (255, 50, 50), 1, tipLength=0.3)
+            orig_y = min(int(y * h / disp_h), h - 1)
+            orig_x = min(int(x * w / disp_w), w - 1)
+            orig_mag = math.hypot(field_x[orig_y, orig_x], field_y[orig_y, orig_x])
+            norm_mag = min(orig_mag / max_mag, 1.0)
             
-    mesh_offset = np.sqrt(field_x**2 + field_y**2)
-    pil_img = Image.fromarray(img)
+            r = int(180 * (1.0 - norm_mag) + 20 * norm_mag)
+            g = int(220 * (1.0 - norm_mag) + 50 * norm_mag)
+            b = 255
+            
+            end = (int(x + dx * 6.0), int(y + dy * 6.0))
+            cv2.arrowedLine(overlay, (x, y), end, (r, g, b), 2, tipLength=0.3)
+            
+    canvas = np.zeros((disp_h + 26, disp_w, 3), dtype=np.uint8)
+    canvas[26:] = overlay
+    pil_img = Image.fromarray(canvas, mode="RGB")
     draw = ImageDraw.Draw(pil_img)
-    draw.rectangle((0, 0, 400, 26), fill=(0, 0, 0))
-    max_val = mesh_offset.max() if mesh_offset.size > 0 else 0.0
-    draw.text((8, 6), f"Displacement Quiver (Max: {max_val:.1f}px, Arrow Scale: 6x)", fill=(255, 255, 255))
+    draw.rectangle((0, 0, disp_w, 26), fill=(0, 0, 0))
+    draw.text((8, 6), f"Displacement Quiver: source (Cyan) + globally aligned ref (Pink) edges | Max: {max_val:.1f}px | Scale: 6x", fill=(255, 255, 255))
     return np.asarray(pil_img).astype(np.float32) / 255.0
 
 
@@ -495,17 +498,14 @@ def _draw_aligned_stack(source_rgb: np.ndarray, reference_rgb: np.ndarray, targe
     src_disp = cv2.resize(src, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
     ref_disp = cv2.resize(ref, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    overlay = np.empty_like(src_disp)
-    overlay[..., 0] = src_disp[..., 0]
-    overlay[..., 1] = ref_disp[..., 1]
-    overlay[..., 2] = ref_disp[..., 2]
+    overlay = _create_edge_overlay(src_disp, ref_disp, bg_color=(15, 20, 30))
 
     canvas = np.zeros((disp_h + 26, disp_w, 3), dtype=np.uint8)
     canvas[26:] = overlay
     img = Image.fromarray(canvas, mode="RGB")
     draw = ImageDraw.Draw(img)
     draw.rectangle((0, 0, disp_w, 26), fill=(0, 0, 0))
-    draw.text((8, 6), "Spatial stack: source (R) + aligned reference (GB)", fill=(255, 255, 255))
+    draw.text((8, 6), "Edge Map Stack: source (Cyan) + aligned reference (Pink)", fill=(255, 255, 255))
     return np.asarray(img).astype(np.float32) / 255.0
 
 
@@ -541,7 +541,7 @@ def _fallback_alignment(source_rgb: np.ndarray, reference_rgb: np.ndarray, match
     aligned_path = match_path.with_name("xfeat_aligned_stack.png")
     warp_path = match_path.with_name("xfeat_warp_field.png")
     zero_field = np.zeros(source_rgb.shape[:2], dtype=np.float32)
-    warp_vis = _draw_warp_field(zero_field, zero_field, bg_rgb=source_rgb)
+    warp_vis = _draw_warp_field(zero_field, zero_field, bg_src=source_rgb, bg_ref=source_rgb)
     _save_rgb(match_path, overlay)
     _save_rgb(aligned_path, aligned_stack)
     _save_rgb(warp_path, warp_vis)
@@ -610,48 +610,88 @@ def _global_warp_is_usable(
     }
 
 
-def _build_mesh_residual_field(
+def _make_border_anchors(width: int, height: int, samples_per_edge: int = 5) -> np.ndarray:
+    xs = np.linspace(0.0, width - 1.0, samples_per_edge, dtype=np.float32)
+    ys = np.linspace(0.0, height - 1.0, samples_per_edge, dtype=np.float32)
+    anchors = np.concatenate(
+        [
+            np.stack([xs, np.zeros_like(xs)], axis=1),
+            np.stack([xs, np.full_like(xs, height - 1.0)], axis=1),
+            np.stack([np.zeros_like(ys), ys], axis=1),
+            np.stack([np.full_like(ys, width - 1.0), ys], axis=1),
+        ],
+        axis=0,
+    )
+    anchor_keys = np.round(anchors, 3)
+    _, unique_idx = np.unique(anchor_keys, axis=0, return_index=True)
+    return anchors[np.sort(unique_idx)].astype(np.float32)
+
+
+def _prepare_piecewise_controls(
     src_pts: np.ndarray,
     ref_pts: np.ndarray,
     inlier_mask: np.ndarray,
     H: np.ndarray,
     out_h: int,
     out_w: int,
-    cfg: XFeatAlignmentConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    inlier_src = src_pts[inlier_mask].astype(np.float32)
-    inlier_ref = ref_pts[inlier_mask].astype(np.float32)
-    if inlier_src.shape[0] == 0:
-        zero = np.zeros((out_h, out_w), dtype=np.float32)
-        return zero, zero
+    target_pts = src_pts[inlier_mask].astype(np.float32)
+    ref_inliers = ref_pts[inlier_mask].astype(np.float32)
+    sample_pts = cv2.perspectiveTransform(ref_inliers.reshape(-1, 1, 2), H).reshape(-1, 2).astype(np.float32)
 
-    projected = cv2.perspectiveTransform(inlier_ref.reshape(-1, 1, 2), H).reshape(-1, 2)
-    residual = (inlier_src - projected).astype(np.float32)
-    diag = max(float((out_w**2 + out_h**2) ** 0.5), 1.0)
-    max_offset = float(cfg.mesh_max_offset_ratio) * diag
-    residual = np.clip(residual, -max_offset, max_offset) * float(cfg.mesh_strength)
+    finite = np.isfinite(target_pts).all(axis=1) & np.isfinite(sample_pts).all(axis=1)
+    target_pts = target_pts[finite]
+    sample_pts = sample_pts[finite]
 
-    grid_size = max(8, int(cfg.mesh_grid_size))
-    yy = np.linspace(0.0, out_h - 1.0, grid_size, dtype=np.float32)
-    xx = np.linspace(0.0, out_w - 1.0, grid_size, dtype=np.float32)
-    mesh_x, mesh_y = np.meshgrid(xx, yy)
-    query = np.stack([mesh_x.reshape(-1), mesh_y.reshape(-1)], axis=1)
+    if target_pts.shape[0] == 0:
+        border = _make_border_anchors(out_w, out_h)
+        return border, border.copy()
 
-    sigma_px = max(float(cfg.mesh_sigma) * diag, 1.0)
-    diff = query[:, None, :] - inlier_src[None, :, :]
-    dist2 = np.sum(diff * diff, axis=2)
-    gauss_weights = np.exp(-0.5 * dist2 / (sigma_px * sigma_px)).astype(np.float32)
-    
-    idw_weights = gauss_weights / np.maximum(dist2, 1e-4)
-    weights_sum = np.maximum(idw_weights.sum(axis=1, keepdims=True), 1e-8)
-    mesh_residual = (idw_weights @ residual) / weights_sum
-    
-    envelope = np.clip(gauss_weights.max(axis=1, keepdims=True) * 5.0, 0.0, 1.0)
-    mesh_residual = mesh_residual * envelope
+    control_keys = np.round(target_pts * 4.0).astype(np.int32)
+    _, unique_idx = np.unique(control_keys, axis=0, return_index=True)
+    unique_idx = np.sort(unique_idx)
+    target_pts = target_pts[unique_idx]
+    sample_pts = sample_pts[unique_idx]
 
-    field_x = cv2.resize(mesh_residual[:, 0].reshape(grid_size, grid_size), (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-    field_y = cv2.resize(mesh_residual[:, 1].reshape(grid_size, grid_size), (out_w, out_h), interpolation=cv2.INTER_CUBIC)
-    return field_x.astype(np.float32), field_y.astype(np.float32)
+    border = _make_border_anchors(out_w, out_h)
+    target_pts = np.concatenate([target_pts, border], axis=0)
+    sample_pts = np.concatenate([sample_pts, border], axis=0)
+    return target_pts.astype(np.float32), sample_pts.astype(np.float32)
+
+
+def _dense_piecewise_inverse_map(
+    inverse_tform: PiecewiseAffineTransform,
+    out_h: int,
+    out_w: int,
+    chunk_rows: int = 128,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    remap_x = np.empty((out_h, out_w), dtype=np.float32)
+    remap_y = np.empty((out_h, out_w), dtype=np.float32)
+    valid = np.empty((out_h, out_w), dtype=bool)
+
+    for y0 in range(0, out_h, chunk_rows):
+        y1 = min(y0 + chunk_rows, out_h)
+        yy, xx = np.meshgrid(
+            np.arange(y0, y1, dtype=np.float32),
+            np.arange(out_w, dtype=np.float32),
+            indexing="ij",
+        )
+        coords = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=1)
+        mapped = inverse_tform(coords)
+        mapped_x = mapped[:, 0].reshape(y1 - y0, out_w)
+        mapped_y = mapped[:, 1].reshape(y1 - y0, out_w)
+        chunk_valid = (
+            np.isfinite(mapped_x)
+            & np.isfinite(mapped_y)
+            & (mapped_x >= 0.0)
+            & (mapped_x <= out_w - 1.0)
+            & (mapped_y >= 0.0)
+            & (mapped_y <= out_h - 1.0)
+        )
+        remap_x[y0:y1] = mapped_x.astype(np.float32)
+        remap_y[y0:y1] = mapped_y.astype(np.float32)
+        valid[y0:y1] = chunk_valid
+    return remap_x, remap_y, valid
 
 
 def _warp_reference_locally(
@@ -662,8 +702,7 @@ def _warp_reference_locally(
     inlier_mask: np.ndarray,
     out_h: int,
     out_w: int,
-    cfg: XFeatAlignmentConfig,
-) -> tuple[np.ndarray, np.ndarray, Dict[str, float], np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
     global_ref = cv2.warpPerspective(reference_rgb.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
     global_mask = cv2.warpPerspective(
         np.ones(reference_rgb.shape[:2], dtype=np.uint8),
@@ -672,19 +711,28 @@ def _warp_reference_locally(
         flags=cv2.INTER_NEAREST,
     ).astype(np.float32)
 
-    field_x, field_y = _build_mesh_residual_field(src_pts, ref_pts, inlier_mask, H, out_h, out_w, cfg)
+    target_pts, sample_pts = _prepare_piecewise_controls(src_pts, ref_pts, inlier_mask, H, out_h, out_w)
+    inverse_tform = PiecewiseAffineTransform.from_estimate(target_pts, sample_pts)
+    remap_x, remap_y, valid_geo_mask = _dense_piecewise_inverse_map(inverse_tform, out_h, out_w)
     yy, xx = np.meshgrid(np.arange(out_h, dtype=np.float32), np.arange(out_w, dtype=np.float32), indexing="ij")
-    remap_x = xx - field_x
-    remap_y = yy - field_y
+    field_x = xx - remap_x
+    field_y = yy - remap_y
 
     warped_ref = cv2.remap(global_ref, remap_x, remap_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    warped_mask = cv2.remap(global_mask, remap_x, remap_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
-    mesh_offset = np.sqrt(field_x * field_x + field_y * field_y)
-    mesh_stats = {
-        "mesh_mean_offset": float(mesh_offset.mean()),
-        "mesh_max_offset": float(mesh_offset.max()),
+    warped_mask = cv2.remap(global_mask, remap_x, remap_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0.5
+    warped_mask &= valid_geo_mask
+
+    control_fit = inverse_tform(target_pts)
+    control_error = np.linalg.norm(control_fit - sample_pts, axis=1)
+    local_offset = np.sqrt(field_x * field_x + field_y * field_y)
+    warp_stats = {
+        "local_control_count": float(target_pts.shape[0]),
+        "local_control_error_mean": float(control_error.mean()),
+        "local_control_error_max": float(control_error.max()),
+        "local_mean_offset": float(local_offset.mean()),
+        "local_max_offset": float(local_offset.max()),
     }
-    return warped_ref, warped_mask, mesh_stats, field_x, field_y
+    return warped_ref, warped_mask, warp_stats, field_x, field_y, global_ref
 
 
 @lru_cache(maxsize=4)
@@ -712,7 +760,6 @@ def run_xfeat_alignment(
     reference_fp = _file_fingerprint(reference_path)
     weights_fp = _file_fingerprint(cfg.weights_path)
     cache_key = {
-        "version": 7,
         "source_fp": source_fp,
         "reference_fp": reference_fp,
         "weights_fp": weights_fp,
@@ -721,10 +768,7 @@ def run_xfeat_alignment(
         "detection_threshold": float(cfg.detection_threshold),
         "multiscale": bool(cfg.multiscale),
         "ransac_threshold": float(cfg.ransac_threshold),
-        "mesh_grid_size": int(cfg.mesh_grid_size),
-        "mesh_sigma": float(cfg.mesh_sigma),
-        "mesh_strength": float(cfg.mesh_strength),
-        "mesh_max_offset_ratio": float(cfg.mesh_max_offset_ratio),
+        "warp_model": "piecewise_affine_v1",
     }
 
     if cache_path.exists():
@@ -744,8 +788,8 @@ def run_xfeat_alignment(
                     cached["reference_rgb"].astype(np.float32),
                 )
                 _save_rgb(aligned_path, aligned_stack)
-                if "field_x" in cached.files and "field_y" in cached.files:
-                    warp_vis = _draw_warp_field(cached["field_x"], cached["field_y"], bg_rgb=cached["source_rgb"])
+                if "field_x" in cached.files and "field_y" in cached.files and "global_ref" in cached.files:
+                    warp_vis = _draw_warp_field(cached["field_x"], cached["field_y"], bg_src=cached["source_rgb"], bg_ref=cached["global_ref"])
                     _save_rgb(warp_path, warp_vis)
                 return {
                     "source_rgb": cached["source_rgb"].astype(np.float32),
@@ -802,22 +846,15 @@ def run_xfeat_alignment(
         result["metrics"]["cache_hit"] = False
         return result
 
-    F_mat, inlier_mask_F = cv2.findFundamentalMat(ref_pts.astype(np.float32), src_pts.astype(np.float32), cv2.FM_RANSAC, actual_ransac_thresh)
-    if F_mat is not None and inlier_mask_F is not None:
-        mesh_inlier_mask = inlier_mask_F.reshape(-1).astype(bool)
-    else:
-        mesh_inlier_mask = inlier_mask.reshape(-1).astype(bool)
-
     src_h, src_w = source_rgb.shape[:2]
-    warped_ref, valid_mask, mesh_stats, field_x, field_y = _warp_reference_locally(
+    warped_ref, valid_mask, warp_stats, field_x, field_y, global_ref = _warp_reference_locally(
         reference_rgb,
         H,
         src_pts,
         ref_pts,
-        mesh_inlier_mask,
+        inlier_mask,
         src_h,
         src_w,
-        cfg,
     )
 
     x, y, w, h = _largest_valid_rect(valid_mask)
@@ -828,11 +865,12 @@ def run_xfeat_alignment(
 
     source_crop = source_rgb[y : y + h, x : x + w].copy()
     ref_crop = warped_ref[y : y + h, x : x + w].copy()
-    overlay = _draw_match_overlay(source_rgb, reference_rgb, src_pts, ref_pts, mesh_inlier_mask, cfg.max_matches_drawn)
+    overlay = _draw_match_overlay(source_rgb, reference_rgb, src_pts, ref_pts, inlier_mask, cfg.max_matches_drawn)
     aligned_stack = _draw_aligned_stack(source_crop, ref_crop)
     fx_crop = field_x[y : y + h, x : x + w]
     fy_crop = field_y[y : y + h, x : x + w]
-    warp_vis = _draw_warp_field(fx_crop, fy_crop, bg_rgb=source_crop)
+    global_ref_crop = global_ref[y : y + h, x : x + w]
+    warp_vis = _draw_warp_field(fx_crop, fy_crop, bg_src=source_crop, bg_ref=global_ref_crop)
     _save_rgb(match_path, overlay)
     _save_rgb(aligned_path, aligned_stack)
     _save_rgb(warp_path, warp_vis)
@@ -854,10 +892,10 @@ def run_xfeat_alignment(
             "crop_bounds": [int(x), int(y), int(w), int(h)],
             "aligned_shape": [int(h), int(w), 3],
             "homography": H.tolist(),
-            "warp_mode": "mesh_local_warp",
+            "warp_mode": "piecewise_affine_local_warp",
             "cache_hit": False,
             **quality,
-            **mesh_stats,
+            **warp_stats,
         },
     }
     np.savez(
@@ -868,6 +906,7 @@ def run_xfeat_alignment(
         overlay_u8=(overlay * 255.0 + 0.5).astype(np.uint8),
         field_x=fx_crop,
         field_y=fy_crop,
+        global_ref=global_ref_crop.astype(np.float16),
         metrics=result["metrics"],
     )
     return result
