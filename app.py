@@ -158,8 +158,12 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     xfeat_seconds = time.perf_counter() - xfeat_started
 
     xfeat_path = alignment["paths"].get("xfeat_matches", "")
+    xfeat_aligned_path = alignment["paths"].get("xfeat_aligned_stack", "")
+    xfeat_warp_path = alignment["paths"].get("xfeat_warp_field", "")
     yield (
         xfeat_path,
+        xfeat_aligned_path,
+        xfeat_warp_path,
         None,
         None,
         None,
@@ -186,6 +190,8 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     base_path = global_metrics["paths"]["base_intermediate"]
     yield (
         xfeat_path,
+        xfeat_aligned_path,
+        xfeat_warp_path,
         base_path,
         None,
         None,
@@ -234,6 +240,8 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     io_seconds = max(total_wall_seconds - total_compute_seconds, 0.0)
     yield (
         xfeat_path,
+        xfeat_aligned_path,
+        xfeat_warp_path,
         base_path,
         paths["grid_viewport"],
         paths.get("edit_map", ""),
@@ -350,12 +358,25 @@ def build_app() -> gr.Blocks:
         with gr.Column():
             with gr.Row(elem_classes="pipeline-arrow-row"):
                 arrow_xfeat = gr.HTML(value=format_arrow_time("XFeat*", None))
-            v4_xfeat = gr.Image(
-                label="XFeat* matches",
-                type="filepath",
-                elem_classes="stage-image",
-                container=False,
-            )
+            with gr.Row(elem_classes="debug-row"):
+                v4_xfeat = gr.Image(
+                    label="XFeat* matches",
+                    type="filepath",
+                    elem_classes="stage-image",
+                    container=False,
+                )
+                v4_xfeat_aligned = gr.Image(
+                    label="Aligned crop stack",
+                    type="filepath",
+                    elem_classes="stage-image",
+                    container=False,
+                )
+                v4_xfeat_warp = gr.Image(
+                    label="Mesh Warp Field",
+                    type="filepath",
+                    elem_classes="stage-image",
+                    container=False,
+                )
 
             with gr.Row(elem_classes="pipeline-arrow-row"):
                 arrow_neural = gr.HTML(value=format_arrow_time("Neural Preset", None))
@@ -405,6 +426,8 @@ def build_app() -> gr.Blocks:
             inputs=[source_image, reference_image],
             outputs=[
                 v4_xfeat,
+                v4_xfeat_aligned,
+                v4_xfeat_warp,
                 v4_base,
                 v4_grid,
                 v4_ref,

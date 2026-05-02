@@ -358,7 +358,7 @@ def _cache_file_path(source_path: str | Path, reference_path: str | Path, cfg: X
     reference_fp = _file_fingerprint(reference_path)
     weights_fp = _file_fingerprint(cfg.weights_path)
     key = {
-        "version": 5,
+        "version": 7,
         "source_fp": source_fp,
         "reference_fp": reference_fp,
         "weights_fp": weights_fp,
@@ -452,6 +452,35 @@ def _draw_match_overlay(
     return np.asarray(img).astype(np.float32) / 255.0
 
 
+def _draw_warp_field(field_x: np.ndarray, field_y: np.ndarray, bg_rgb: Optional[np.ndarray] = None, step: int = 32) -> np.ndarray:
+    h, w = field_x.shape
+    if bg_rgb is not None:
+        bg_gray = cv2.cvtColor((np.clip(bg_rgb, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        img = cv2.cvtColor(bg_gray, cv2.COLOR_GRAY2RGB)
+        img = (img * 0.4 + 153).astype(np.uint8)
+    else:
+        img = np.full((h, w, 3), 255, dtype=np.uint8)
+        
+    for y in range(step // 2, h, step):
+        for x in range(step // 2, w, step):
+            dx = field_x[y, x]
+            dy = field_y[y, x]
+            if abs(dx) < 0.5 and abs(dy) < 0.5:
+                cv2.circle(img, (x, y), 1, (200, 200, 200), -1)
+                continue
+            
+            end = (int(x + dx * 6.0 ), int(y + dy * 6.0 ))
+            cv2.arrowedLine(img, (x, y), end, (255, 50, 50), 1, tipLength=0.3)
+            
+    mesh_offset = np.sqrt(field_x**2 + field_y**2)
+    pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img)
+    draw.rectangle((0, 0, 400, 26), fill=(0, 0, 0))
+    max_val = mesh_offset.max() if mesh_offset.size > 0 else 0.0
+    draw.text((8, 6), f"Displacement Quiver (Max: {max_val:.1f}px, Arrow Scale: 6x)", fill=(255, 255, 255))
+    return np.asarray(pil_img).astype(np.float32) / 255.0
+
+
 def _draw_aligned_stack(source_rgb: np.ndarray, reference_rgb: np.ndarray, target_h: int = 720) -> np.ndarray:
     src = (np.clip(source_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     ref = (np.clip(reference_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
@@ -510,14 +539,19 @@ def _fallback_alignment(source_rgb: np.ndarray, reference_rgb: np.ndarray, match
     overlay = _draw_match_overlay(source_rgb, reference_rgb, np.empty((0, 2)), np.empty((0, 2)), np.zeros(0), 0, fallback_text=reason)
     aligned_stack = _draw_aligned_stack(source_rgb, reference_rgb)
     aligned_path = match_path.with_name("xfeat_aligned_stack.png")
+    warp_path = match_path.with_name("xfeat_warp_field.png")
+    zero_field = np.zeros(source_rgb.shape[:2], dtype=np.float32)
+    warp_vis = _draw_warp_field(zero_field, zero_field, bg_rgb=source_rgb)
     _save_rgb(match_path, overlay)
     _save_rgb(aligned_path, aligned_stack)
+    _save_rgb(warp_path, warp_vis)
     return {
         "source_rgb": source_rgb,
         "reference_rgb": reference_rgb,
         "paths": {
             "xfeat_matches": str(match_path),
             "xfeat_aligned_stack": str(aligned_path),
+            "xfeat_warp_field": str(warp_path),
         },
         "metrics": {
             "status": "fallback",
@@ -629,7 +663,7 @@ def _warp_reference_locally(
     out_h: int,
     out_w: int,
     cfg: XFeatAlignmentConfig,
-) -> tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+) -> tuple[np.ndarray, np.ndarray, Dict[str, float], np.ndarray, np.ndarray]:
     global_ref = cv2.warpPerspective(reference_rgb.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
     global_mask = cv2.warpPerspective(
         np.ones(reference_rgb.shape[:2], dtype=np.uint8),
@@ -650,7 +684,7 @@ def _warp_reference_locally(
         "mesh_mean_offset": float(mesh_offset.mean()),
         "mesh_max_offset": float(mesh_offset.max()),
     }
-    return warped_ref, warped_mask, mesh_stats
+    return warped_ref, warped_mask, mesh_stats, field_x, field_y
 
 
 @lru_cache(maxsize=4)
@@ -671,13 +705,14 @@ def run_xfeat_alignment(
     output_dir.mkdir(parents=True, exist_ok=True)
     match_path = output_dir / "xfeat_matches.png"
     aligned_path = output_dir / "xfeat_aligned_stack.png"
+    warp_path = output_dir / "xfeat_warp_field.png"
     cache_path = _cache_file_path(source_path, reference_path, cfg)
 
     source_fp = _file_fingerprint(source_path)
     reference_fp = _file_fingerprint(reference_path)
     weights_fp = _file_fingerprint(cfg.weights_path)
     cache_key = {
-        "version": 5,
+        "version": 7,
         "source_fp": source_fp,
         "reference_fp": reference_fp,
         "weights_fp": weights_fp,
@@ -709,12 +744,16 @@ def run_xfeat_alignment(
                     cached["reference_rgb"].astype(np.float32),
                 )
                 _save_rgb(aligned_path, aligned_stack)
+                if "field_x" in cached.files and "field_y" in cached.files:
+                    warp_vis = _draw_warp_field(cached["field_x"], cached["field_y"], bg_rgb=cached["source_rgb"])
+                    _save_rgb(warp_path, warp_vis)
                 return {
                     "source_rgb": cached["source_rgb"].astype(np.float32),
                     "reference_rgb": cached["reference_rgb"].astype(np.float32),
                     "paths": {
                         "xfeat_matches": str(match_path),
                         "xfeat_aligned_stack": str(aligned_path),
+                        "xfeat_warp_field": str(warp_path) if "field_x" in cached.files else "",
                     },
                     "metrics": {**cached["metrics"].item(), "cache_hit": True},
                 }
@@ -770,7 +809,7 @@ def run_xfeat_alignment(
         mesh_inlier_mask = inlier_mask.reshape(-1).astype(bool)
 
     src_h, src_w = source_rgb.shape[:2]
-    warped_ref, valid_mask, mesh_stats = _warp_reference_locally(
+    warped_ref, valid_mask, mesh_stats, field_x, field_y = _warp_reference_locally(
         reference_rgb,
         H,
         src_pts,
@@ -791,8 +830,12 @@ def run_xfeat_alignment(
     ref_crop = warped_ref[y : y + h, x : x + w].copy()
     overlay = _draw_match_overlay(source_rgb, reference_rgb, src_pts, ref_pts, mesh_inlier_mask, cfg.max_matches_drawn)
     aligned_stack = _draw_aligned_stack(source_crop, ref_crop)
+    fx_crop = field_x[y : y + h, x : x + w]
+    fy_crop = field_y[y : y + h, x : x + w]
+    warp_vis = _draw_warp_field(fx_crop, fy_crop, bg_rgb=source_crop)
     _save_rgb(match_path, overlay)
     _save_rgb(aligned_path, aligned_stack)
+    _save_rgb(warp_path, warp_vis)
 
     result = {
         "source_rgb": source_crop,
@@ -800,6 +843,7 @@ def run_xfeat_alignment(
         "paths": {
             "xfeat_matches": str(match_path),
             "xfeat_aligned_stack": str(aligned_path),
+            "xfeat_warp_field": str(warp_path),
         },
         "metrics": {
             "status": "ok",
@@ -819,9 +863,11 @@ def run_xfeat_alignment(
     np.savez(
         cache_path,
         meta=cache_key,
-        source_rgb=source_crop.astype(np.float32),
-        reference_rgb=ref_crop.astype(np.float32),
-        overlay_u8=(np.clip(overlay, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8),
+        source_rgb=source_crop.astype(np.float16),
+        reference_rgb=ref_crop.astype(np.float16),
+        overlay_u8=(overlay * 255.0 + 0.5).astype(np.uint8),
+        field_x=fx_crop,
+        field_y=fy_crop,
         metrics=result["metrics"],
     )
     return result
