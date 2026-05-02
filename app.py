@@ -162,8 +162,8 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     xfeat_warp_path = alignment["paths"].get("xfeat_warp_field", "")
     yield (
         xfeat_path,
-        xfeat_aligned_path,
         xfeat_warp_path,
+        xfeat_aligned_path,
         None,
         None,
         None,
@@ -190,8 +190,8 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     base_path = global_metrics["paths"]["base_intermediate"]
     yield (
         xfeat_path,
-        xfeat_aligned_path,
         xfeat_warp_path,
+        xfeat_aligned_path,
         base_path,
         None,
         None,
@@ -240,8 +240,8 @@ def run_v040(source_path: Optional[str], reference_path: Optional[str]) -> Gener
     io_seconds = max(total_wall_seconds - total_compute_seconds, 0.0)
     yield (
         xfeat_path,
-        xfeat_aligned_path,
         xfeat_warp_path,
+        xfeat_aligned_path,
         base_path,
         paths["grid_viewport"],
         paths.get("edit_map", ""),
@@ -365,14 +365,14 @@ def build_app() -> gr.Blocks:
                     elem_classes="stage-image",
                     container=False,
                 )
-                v4_xfeat_aligned = gr.Image(
-                    label="Aligned crop stack",
+                v4_xfeat_warp = gr.Image(
+                    label="Mesh Warp Field",
                     type="filepath",
                     elem_classes="stage-image",
                     container=False,
                 )
-                v4_xfeat_warp = gr.Image(
-                    label="Mesh Warp Field",
+                v4_xfeat_aligned = gr.Image(
+                    label="Aligned crop stack",
                     type="filepath",
                     elem_classes="stage-image",
                     container=False,
@@ -426,8 +426,8 @@ def build_app() -> gr.Blocks:
             inputs=[source_image, reference_image],
             outputs=[
                 v4_xfeat,
-                v4_xfeat_aligned,
                 v4_xfeat_warp,
+                v4_xfeat_aligned,
                 v4_base,
                 v4_grid,
                 v4_ref,
