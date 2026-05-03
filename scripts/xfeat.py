@@ -431,6 +431,44 @@ def _create_edge_overlay(src_disp: np.ndarray, ref_disp: np.ndarray, bg_color: t
     return overlay
 
 
+def _draw_overlap_difference(source_rgb: np.ndarray, reference_rgb: np.ndarray, target_h: int = 720) -> np.ndarray:
+    src = (np.clip(source_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    ref = (np.clip(reference_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+    height, width = source_rgb.shape[:2]
+    if reference_rgb.shape[:2] != (height, width):
+        ref = cv2.resize(ref, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    scale = target_h / max(height, 1)
+    disp_h = max(64, min(int(round(height * scale)), target_h))
+    disp_w = max(1, int(round(width * (disp_h / max(height, 1)))))
+    src_disp = cv2.resize(src, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+    ref_disp = cv2.resize(ref, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+
+    src_f = src_disp.astype(np.float32) / 255.0
+    ref_f = ref_disp.astype(np.float32) / 255.0
+    diff = np.abs(src_f - ref_f)
+    diff_mag = np.sqrt(np.mean(diff * diff, axis=2))
+    diff_mag = cv2.GaussianBlur(diff_mag, (0, 0), 1.2)
+
+    max_diff = float(np.percentile(diff_mag, 99.0)) if diff_mag.size else 1.0
+    max_diff = max(max_diff, 1e-6)
+    diff_norm = np.clip(diff_mag / max_diff, 0.0, 1.0)
+
+    overlay = np.empty_like(src_f)
+    overlay[..., 0] = ref_f[..., 0]
+    overlay[..., 1] = src_f[..., 1]
+    overlay[..., 2] = src_f[..., 2]
+
+    canvas = np.zeros((disp_h + 26, disp_w, 3), dtype=np.uint8)
+    canvas[26:] = (overlay * 255.0 + 0.5).astype(np.uint8)
+    pil_img = Image.fromarray(canvas, mode="RGB")
+    draw = ImageDraw.Draw(pil_img)
+    draw.rectangle((0, 0, disp_w, 26), fill=(0, 0, 0))
+    draw.text((8, 6), "Natural Overlap: source + aligned reference with differences highlighted", fill=(255, 255, 255))
+    return np.asarray(pil_img).astype(np.float32) / 255.0
+
+
 def _draw_warp_field(field_x: np.ndarray, field_y: np.ndarray, bg_src: Optional[np.ndarray] = None, bg_ref: Optional[np.ndarray] = None, step: int = 32, target_h: int = 720) -> np.ndarray:
     h, w = field_x.shape
     scale = target_h / max(h, 1)
@@ -485,28 +523,7 @@ def _draw_warp_field(field_x: np.ndarray, field_y: np.ndarray, bg_src: Optional[
 
 
 def _draw_aligned_stack(source_rgb: np.ndarray, reference_rgb: np.ndarray, target_h: int = 720) -> np.ndarray:
-    src = (np.clip(source_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-    ref = (np.clip(reference_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-
-    height, width = source_rgb.shape[:2]
-    if reference_rgb.shape[:2] != (height, width):
-        ref = cv2.resize(ref, (width, height), interpolation=cv2.INTER_LINEAR)
-
-    scale = target_h / max(height, 1)
-    disp_h = max(64, min(int(round(height * scale)), target_h))
-    disp_w = max(1, int(round(width * (disp_h / max(height, 1)))))
-    src_disp = cv2.resize(src, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
-    ref_disp = cv2.resize(ref, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
-
-    overlay = _create_edge_overlay(src_disp, ref_disp, bg_color=(15, 20, 30))
-
-    canvas = np.zeros((disp_h + 26, disp_w, 3), dtype=np.uint8)
-    canvas[26:] = overlay
-    img = Image.fromarray(canvas, mode="RGB")
-    draw = ImageDraw.Draw(img)
-    draw.rectangle((0, 0, disp_w, 26), fill=(0, 0, 0))
-    draw.text((8, 6), "Edge Map Stack: source (Cyan) + aligned reference (Pink)", fill=(255, 255, 255))
-    return np.asarray(img).astype(np.float32) / 255.0
+    return _draw_overlap_difference(source_rgb, reference_rgb, target_h=target_h)
 
 
 def _largest_valid_rect(mask: np.ndarray) -> tuple[int, int, int, int]:

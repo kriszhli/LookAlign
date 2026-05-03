@@ -372,7 +372,7 @@ def build_app() -> gr.Blocks:
                     container=False,
                 )
                 v4_xfeat_aligned = gr.Image(
-                    label="Aligned crop stack",
+                    label="Natural overlap + differences",
                     type="filepath",
                     elem_classes="stage-image",
                     container=False,
