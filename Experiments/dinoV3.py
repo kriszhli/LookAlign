@@ -12,11 +12,6 @@ import timm
 import torch
 import torch.nn.functional as F
 
-try:
-    from .EoMT import EomtSegmenter
-except ImportError:
-    from EoMT import EomtSegmenter
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -29,10 +24,6 @@ MAX_CLUSTERS = 8
 MANUAL_CLUSTER_MAX = 40
 VRAM_LIMIT_GIB = 8.0
 VRAM_LIMIT_BYTES = int(VRAM_LIMIT_GIB * (1024 ** 3))
-
-METHOD_EOMT = "eomt"
-METHOD_KMEANS = "kmeans"
-
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -54,7 +45,10 @@ class DeviceSelection:
 @dataclass
 class RunArtifacts:
     status: str
-    overlay_map: Image.Image
+    kmeans_overlay: Image.Image
+    kmeans_mask: Image.Image
+    anyup_overlay: Image.Image
+    anyup_mask: Image.Image
     elapsed: float
     requires_cpu_confirmation: bool = False
     device_type: str = "unknown"
@@ -67,13 +61,6 @@ MODEL_SPEC = ModelSpec(
     checkpoint_path=ROOT_DIR / "ckpts" / "dinov3_vitl16_pretrain_lvd1689m.pth",
     target_short_side=640,
 )
-
-
-def normalize_method(method: str) -> str:
-    normalized = (method or METHOD_EOMT).strip().lower()
-    if normalized not in {METHOD_EOMT, METHOD_KMEANS}:
-        raise ValueError(f"Unsupported method: {method}")
-    return normalized
 
 
 def select_device(allow_cpu: bool) -> DeviceSelection:
@@ -293,7 +280,11 @@ def resolve_cluster_count(num_patches: int, manual_clusters: int) -> Tuple[int, 
 class DinoRunner:
     def __init__(self, model_spec: ModelSpec) -> None:
         self.model_spec = model_spec
-        self.eomt = EomtSegmenter()
+        try:
+            from .anyUp import AnyUpUpsampler
+        except ImportError:
+            from anyUp import AnyUpUpsampler
+        self.anyup = AnyUpUpsampler()
 
     def _empty_outputs(self, size: Tuple[int, int]) -> Tuple[Image.Image, ...]:
         return (make_error_image(size),)
@@ -302,10 +293,7 @@ class DinoRunner:
         lines = [f"VRAM budget: {VRAM_LIMIT_GIB:.2f} GiB"]
         if device.type == "mps":
             recommended = int(torch.mps.recommended_max_memory())
-            fraction = min(1.0, VRAM_LIMIT_BYTES / max(1, recommended))
-            torch.mps.set_per_process_memory_fraction(fraction)
             lines.append(f"MPS recommended max: {format_gib(recommended)}")
-            lines.append(f"MPS per-process limit fraction: {fraction:.3f}")
         elif device.type == "cuda":
             lines.append("CUDA hard VRAM cap is not configured; runtime will report failures if the model exceeds budget.")
         else:
@@ -320,21 +308,24 @@ class DinoRunner:
         self,
         image: Image.Image | None,
         manual_clusters: int = 0,
-        method: str = METHOD_EOMT,
         allow_cpu: bool = False,
+        pca_dims: int = 32,
+        q_chunk_size: int = 256,
     ) -> RunArtifacts:
         if image is None:
             image = Image.open(DEFAULT_IMAGE_PATH).convert("RGB")
         else:
             image = image.convert("RGB")
 
-        method = normalize_method(method)
         display_image = resize_for_model(image, target_short_side=self.model_spec.target_short_side)
         selection = select_device(allow_cpu=allow_cpu)
         if selection.device is None:
             return RunArtifacts(
                 status="\n".join(selection.status_lines),
-                overlay_map=display_image,
+                kmeans_overlay=display_image,
+                kmeans_mask=display_image,
+                anyup_overlay=display_image,
+                anyup_mask=display_image,
                 elapsed=0.0,
                 requires_cpu_confirmation=True,
                 device_type="unavailable",
@@ -344,10 +335,11 @@ class DinoRunner:
             image=image,
             display_image=display_image,
             manual_clusters=manual_clusters,
-            method=method,
             device=selection.device,
             status_prefix=selection.status_lines,
             used_cpu_confirmation=selection.used_cpu_confirmation,
+            pca_dims=pca_dims,
+            q_chunk_size=q_chunk_size,
         )
 
     def _run_model(
@@ -355,34 +347,33 @@ class DinoRunner:
         image: Image.Image,
         display_image: Image.Image,
         manual_clusters: int,
-        method: str,
         device: torch.device,
         status_prefix: List[str],
         used_cpu_confirmation: bool,
+        pca_dims: int,
+        q_chunk_size: int,
     ) -> RunArtifacts:
         limit_lines = self._configure_device_limit(device)
         memory_before = collect_memory_stats(device)
         start_time = time.perf_counter()
         try:
-            if method == METHOD_KMEANS:
-                method_lines, overlay_map = self._run_kmeans(
-                    image=display_image,
-                    device=device,
-                    manual_clusters=manual_clusters,
-                )
-            else:
-                method_lines, overlay_map = self._run_eomt(
-                    image=image,
-                    display_size=display_image.size,
-                    device=device,
-                )
-
+            method_lines, kmeans_overlay, kmeans_mask, anyup_overlay, anyup_mask = self._run_feature_upsampling(
+                source_image=image,
+                display_image=display_image,
+                device=device,
+                manual_clusters=manual_clusters,
+                pca_dims=pca_dims,
+                q_chunk_size=q_chunk_size,
+            )
             synchronize_device(device)
             elapsed = time.perf_counter() - start_time
             method_lines.append(f"Time: {elapsed:.2f}s")
             artifact = RunArtifacts(
                 status="\n".join(method_lines),
-                overlay_map=overlay_map,
+                kmeans_overlay=kmeans_overlay,
+                kmeans_mask=kmeans_mask,
+                anyup_overlay=anyup_overlay,
+                anyup_mask=anyup_mask,
                 elapsed=elapsed,
                 requires_cpu_confirmation=False,
                 device_type=device.type,
@@ -390,13 +381,16 @@ class DinoRunner:
         except Exception as error:
             if self._is_memory_budget_error(error):
                 message = (
-                    f"{method.upper()}: skipped because it exceeded the {VRAM_LIMIT_GIB:.2f} GiB device budget."
+                    f"DINOv3 AnyUp: skipped because it exceeded the {VRAM_LIMIT_GIB:.2f} GiB device budget."
                 )
             else:
-                message = f"{method.upper()}: failed: {''.join(traceback.format_exception_only(type(error), error)).strip()}"
+                message = f"DINOv3 AnyUp failed: {''.join(traceback.format_exception_only(type(error), error)).strip()}"
             artifact = RunArtifacts(
                 status=message,
-                overlay_map=make_error_image(display_image.size),
+                kmeans_overlay=make_error_image(image.size),
+                kmeans_mask=make_error_image(image.size),
+                anyup_overlay=make_error_image(image.size),
+                anyup_mask=make_error_image(image.size),
                 elapsed=0.0,
                 requires_cpu_confirmation=False,
                 device_type=device.type,
@@ -404,10 +398,10 @@ class DinoRunner:
 
         memory_after = collect_memory_stats(device)
         summary_lines = list(status_prefix)
-        summary_lines.append(f"Method: {method.upper()}")
+        summary_lines.append("Method: DINOv3 KMeans + AnyUp")
         if used_cpu_confirmation:
             summary_lines.append("CPU confirmation: approved")
-        summary_lines.extend(line for line in limit_lines if "fraction" in line)
+        summary_lines.extend(line for line in limit_lines if "recommended max" in line)
         summary_lines.append(artifact.status)
         memory_lines = format_memory_lines(memory_before, memory_after, device)
         if memory_lines:
@@ -416,57 +410,64 @@ class DinoRunner:
             summary_lines.extend(line for line in memory_lines[1:] if "current/driver" in line)
         return RunArtifacts(
             status="\n".join(message for message in summary_lines if message),
-            overlay_map=artifact.overlay_map,
+            kmeans_overlay=artifact.kmeans_overlay,
+            kmeans_mask=artifact.kmeans_mask,
+            anyup_overlay=artifact.anyup_overlay,
+            anyup_mask=artifact.anyup_mask,
             elapsed=artifact.elapsed,
             requires_cpu_confirmation=artifact.requires_cpu_confirmation,
             device_type=artifact.device_type,
         )
 
-    def _run_kmeans(
+    def _run_feature_upsampling(
         self,
-        image: Image.Image,
+        source_image: Image.Image,
+        display_image: Image.Image,
         device: torch.device,
         manual_clusters: int,
-    ) -> Tuple[List[str], Image.Image]:
-        from kMeans import build_overlay_from_features
+        pca_dims: int,
+        q_chunk_size: int,
+    ) -> Tuple[List[str], Image.Image, Image.Image, Image.Image, Image.Image]:
+        try:
+            from .kMeans import build_overlay_from_features
+            from .anyUp import build_anyup_overlay_from_features
+        except ImportError:
+            from kMeans import build_overlay_from_features
+            from anyUp import build_anyup_overlay_from_features
 
         tokens, patch_features, resized, grid_h, grid_w, cluster_count, cluster_mode = extract_patch_features(
             self.model_spec,
-            image,
+            display_image,
             device,
             manual_clusters,
         )
-        overlay_map = build_overlay_from_features(
+        kmeans_overlay, kmeans_mask = build_overlay_from_features(
             patch_features=patch_features,
             grid_h=grid_h,
             grid_w=grid_w,
             cluster_count=cluster_count,
-            base_image=resized,
+            base_image=source_image,
+        )
+        anyup_overlay, anyup_mask, projected_dim = build_anyup_overlay_from_features(
+            patch_features=patch_features,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            cluster_count=cluster_count,
+            source_image=source_image,
+            output_size=source_image.size,
+            device=device,
+            upsampler=self.anyup,
+            pca_dims=pca_dims,
+            q_chunk_size=q_chunk_size,
         )
         lines = [
             f"Model: {self.model_spec.label}",
-            f"Size: {resized.size[0]}x{resized.size[1]}",
-            f"Grid: {grid_h}x{grid_w}",
+            f"DINO input size: {resized.size[0]}x{resized.size[1]}",
+            f"Patch grid: {grid_h}x{grid_w}",
             f"Tokens: {tokens.shape[1]}",
             f"Clusters: {cluster_count} ({cluster_mode})",
+            f"AnyUp output size: {source_image.size[0]}x{source_image.size[1]}",
+            f"AnyUp projected dims: {projected_dim}",
+            f"AnyUp q_chunk_size: {q_chunk_size}",
         ]
-        return lines, overlay_map
-
-    def _run_eomt(
-        self,
-        image: Image.Image,
-        display_size: Tuple[int, int],
-        device: torch.device,
-    ) -> Tuple[List[str], Image.Image]:
-        artifacts = self.eomt.segment(image=image, output_size=display_size, device=device)
-        label_count = int(np.unique(artifacts.label_map).size)
-        lines = [
-            "Model: EoMT-DINOv3 Large",
-            f"Input: {image.size[0]}x{image.size[1]}",
-            f"Display: {display_size[0]}x{display_size[1]}",
-            "Processor: 512 split-window ADE semantic map",
-            artifacts.source_label,
-            f"Predicted classes: {label_count}",
-            artifacts.label_summary,
-        ]
-        return lines, artifacts.overlay_map
+        return lines, kmeans_overlay, kmeans_mask, anyup_overlay, anyup_mask

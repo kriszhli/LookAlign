@@ -4,15 +4,15 @@ import gradio as gr
 from PIL import Image
 
 try:
-    from .dinoV3 import DEFAULT_IMAGE_PATH, DinoRunner, METHOD_EOMT, METHOD_KMEANS, MODEL_SPEC
+    from .dinoV3 import DEFAULT_IMAGE_PATH, DinoRunner, MODEL_SPEC
 except ImportError:
-    from dinoV3 import DEFAULT_IMAGE_PATH, DinoRunner, METHOD_EOMT, METHOD_KMEANS, MODEL_SPEC
+    from dinoV3 import DEFAULT_IMAGE_PATH, DinoRunner, MODEL_SPEC
 
 
 def build_interface(runner: DinoRunner) -> gr.Blocks:
     css = """
     .app-shell {
-        max-width: 1400px;
+        max-width: 1500px;
         margin: 0 auto;
     }
     .app-header {
@@ -43,45 +43,39 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
     }
     .debug-box textarea,
     .debug-box pre {
-        font-family: ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
         font-size: 12px !important;
         line-height: 1.45 !important;
     }
     """
 
-    def run_analysis(image: Image.Image, method: str, cluster_count: float, allow_cpu: bool):
+    def run_analysis(image: Image.Image, cluster_count: float, pca_dims: float, allow_cpu: bool):
         artifacts = runner.run(
             image=image,
             manual_clusters=int(cluster_count),
-            method=method,
             allow_cpu=bool(allow_cpu),
+            pca_dims=int(pca_dims),
         )
         cpu_visible = artifacts.requires_cpu_confirmation or artifacts.device_type == "cpu"
         cpu_value = bool(allow_cpu) if cpu_visible else False
         return (
             artifacts.status,
-            artifacts.overlay_map,
+            (artifacts.kmeans_overlay, artifacts.kmeans_mask),
+            (artifacts.anyup_overlay, artifacts.anyup_mask),
             gr.update(visible=cpu_visible, value=cpu_value),
-        )
-
-    def sync_controls(method: str):
-        is_kmeans = method == METHOD_KMEANS
-        return (
-            gr.update(visible=is_kmeans),
-            gr.update(visible=False, value=False),
         )
 
     def reset_cpu_confirmation():
         return gr.update(visible=False, value=False)
 
-    with gr.Blocks(title="DINOv3 Segmentation Viewer") as demo:
+    with gr.Blocks(title="DINOv3 AnyUp Viewer") as demo:
         with gr.Column(elem_classes="app-shell"):
             gr.HTML(f"<style>{css}</style>")
             gr.Markdown(
                 """
                 <div class="app-header">
-                  <h2>DINOv3 Segmentation Viewer</h2>
-                  <div class="app-subtitle">Offline EoMT semantic segmentation with KMeans baseline comparison and accelerator-first execution.</div>
+                  <h2>DINOv3 AnyUp Viewer</h2>
+                  <div class="app-subtitle">DINOv3 patch KMeans baseline beside official AnyUp feature upsampling.</div>
                 </div>
                 """
             )
@@ -95,19 +89,23 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
                     show_label=True,
                     sources=["upload", "clipboard"],
                 )
-                overlay_map = gr.Image(
-                    label="Overlay",
+                kmeans_slider = gr.ImageSlider(
+                    label="KMeans Baseline: Overlay / Mask",
                     height=560,
                     elem_classes="surface",
                     show_label=True,
+                    type="pil",
+                    slider_position=50,
+                )
+                anyup_slider = gr.ImageSlider(
+                    label="AnyUp: Overlay / Mask",
+                    height=560,
+                    elem_classes="surface",
+                    show_label=True,
+                    type="pil",
+                    slider_position=50,
                 )
             with gr.Row(elem_classes="controls-row"):
-                method_select = gr.Dropdown(
-                    label="Method",
-                    choices=[METHOD_EOMT, METHOD_KMEANS],
-                    value=METHOD_EOMT,
-                    interactive=True,
-                )
                 cluster_slider = gr.Slider(
                     label="Clusters",
                     info="0 uses the automatic heuristic.",
@@ -115,10 +113,17 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
                     maximum=40,
                     value=0,
                     step=1,
-                    visible=False,
+                )
+                pca_slider = gr.Slider(
+                    label="AnyUp feature dimensions",
+                    info="PCA-compressed DINOv3 feature channels passed into AnyUp.",
+                    minimum=8,
+                    maximum=128,
+                    value=32,
+                    step=8,
                 )
             cpu_confirm = gr.Checkbox(
-                label="MPS/CUDA unavailable. Check this box, then run again to allow CPU execution for the current input and method.",
+                label="MPS/CUDA unavailable. Check this box, then run again to allow CPU execution for the current input.",
                 value=False,
                 visible=False,
             )
@@ -134,15 +139,9 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
 
         run_button.click(
             fn=run_analysis,
-            inputs=[input_image, method_select, cluster_slider, cpu_confirm],
-            outputs=[status, overlay_map, cpu_confirm],
+            inputs=[input_image, cluster_slider, pca_slider, cpu_confirm],
+            outputs=[status, kmeans_slider, anyup_slider, cpu_confirm],
             show_progress="minimal",
-        )
-        method_select.change(
-            fn=sync_controls,
-            inputs=[method_select],
-            outputs=[cluster_slider, cpu_confirm],
-            show_progress="hidden",
         )
         input_image.change(
             fn=reset_cpu_confirmation,
@@ -155,12 +154,13 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DINOv3 segmentation viewer")
+    parser = argparse.ArgumentParser(description="DINOv3 AnyUp viewer")
     parser.add_argument("--host", default="127.0.0.1", help="Host interface for Gradio")
     parser.add_argument("--port", type=int, default=7860, help="Port for Gradio")
     parser.add_argument("--share", action="store_true", help="Enable Gradio share links")
     parser.add_argument("--smoke-test", action="store_true", help="Run one pass and exit")
-    parser.add_argument("--method", choices=[METHOD_EOMT, METHOD_KMEANS], default=METHOD_EOMT, help="Segmentation method")
+    parser.add_argument("--clusters", type=int, default=0, help="Cluster count; 0 uses the automatic heuristic")
+    parser.add_argument("--pca-dims", type=int, default=32, help="PCA dimensions for upsampled DINOv3 features")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow CPU inference when MPS/CUDA is unavailable")
     return parser.parse_args()
 
@@ -170,7 +170,12 @@ def main() -> None:
     runner = DinoRunner(MODEL_SPEC)
     if args.smoke_test:
         image = Image.open(DEFAULT_IMAGE_PATH).convert("RGB")
-        artifacts = runner.run(image=image, manual_clusters=0, method=args.method, allow_cpu=args.allow_cpu)
+        artifacts = runner.run(
+            image=image,
+            manual_clusters=args.clusters,
+            allow_cpu=args.allow_cpu,
+            pca_dims=args.pca_dims,
+        )
         print(artifacts.status)
         if artifacts.requires_cpu_confirmation:
             raise SystemExit(2)

@@ -64,7 +64,7 @@ def build_overlay_from_features(
     grid_w: int,
     cluster_count: int,
     base_image: Image.Image,
-) -> Image.Image:
+) -> tuple[Image.Image, Image.Image]:
     cluster_labels = cluster_patch_features(
         patch_features=patch_features,
         grid_h=grid_h,
@@ -72,4 +72,4 @@ def build_overlay_from_features(
         cluster_count=cluster_count,
     )
     cluster_map = render_cluster_map(cluster_labels, grid_h, grid_w, base_image.size)
-    return overlay_clusters(base_image, cluster_map)
+    return overlay_clusters(base_image, cluster_map), cluster_map
