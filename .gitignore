@@ -17,3 +17,4 @@ __pycache__/
 .venv/
 venv/
 ReferenceArticles/
+ckpts/dinov3_vitl16_pretrain_lvd1689m.pth
