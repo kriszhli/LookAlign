@@ -1,4 +1,3 @@
-import sys
 from pathlib import Path
 from typing import Tuple
 
@@ -17,17 +16,13 @@ except ImportError:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
-ANYUP_ROOT = ROOT_DIR / "third_party" / "AnyUp"
 ANYUP_MODEL_DIR = SCRIPT_DIR / "models"
 ANYUP_CHECKPOINT_NAME = "anyup_multi_backbone.pth"
-ANYUP_CHECKPOINT_URL = (
-    "https://github.com/wimmerth/anyup/releases/download/checkpoint_v2/anyup_multi_backbone.pth"
-)
 
-if str(ANYUP_ROOT) not in sys.path:
-    sys.path.insert(0, str(ANYUP_ROOT))
-
-from anyup.model import AnyUp
+try:
+    from .anyup_model import AnyUp
+except ImportError:
+    from anyup_model import AnyUp
 
 
 DEFAULT_PCA_DIMS = 32
@@ -108,16 +103,9 @@ class AnyUpUpsampler:
 
         ANYUP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         checkpoint_path = ANYUP_MODEL_DIR / ANYUP_CHECKPOINT_NAME
-        if checkpoint_path.exists():
-            state_dict = torch.load(checkpoint_path, map_location="cpu")
-        else:
-            state_dict = torch.hub.load_state_dict_from_url(
-                ANYUP_CHECKPOINT_URL,
-                model_dir=str(ANYUP_MODEL_DIR),
-                file_name=ANYUP_CHECKPOINT_NAME,
-                progress=True,
-                map_location="cpu",
-            )
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"AnyUp checkpoint not found: {checkpoint_path}")
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
 
         model = AnyUp().to(device).eval()
         model.load_state_dict(state_dict)
