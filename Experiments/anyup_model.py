@@ -344,10 +344,21 @@ class AnyUp(nn.Module):
         ]
         return nn.Sequential(pre, *blocks)
 
+    @staticmethod
+    def _adaptive_avg_pool_compatible(x: torch.Tensor, output_size: Tuple[int, int]) -> torch.Tensor:
+        in_h, in_w = x.shape[-2:]
+        out_h, out_w = output_size
+        if x.device.type == "mps":
+            divisible_h = (in_h % out_h) == 0
+            divisible_w = (in_w % out_w) == 0
+            if not (divisible_h and divisible_w):
+                return F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
+        return F.adaptive_avg_pool2d(x, output_size=output_size)
+
     def upsample(self, enc_img, feats, out_size, vis_attn=False, q_chunk_size=None):
         _, _, height, width = feats.shape
-        q = F.adaptive_avg_pool2d(self.query_encoder(enc_img), output_size=out_size)
-        k = F.adaptive_avg_pool2d(self.key_encoder(enc_img), output_size=(height, width))
+        q = self._adaptive_avg_pool_compatible(self.query_encoder(enc_img), output_size=out_size)
+        k = self._adaptive_avg_pool_compatible(self.key_encoder(enc_img), output_size=(height, width))
         k = torch.cat([k, self.key_features_encoder(F.normalize(feats, dim=1))], dim=1)
         k = self.aggregation(k)
         v = feats

@@ -49,12 +49,19 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
     }
     """
 
-    def run_analysis(image: Image.Image, cluster_count: float, pca_dims: float, allow_cpu: bool):
+    def run_analysis(
+        image: Image.Image,
+        cluster_count: float,
+        pca_dims: float,
+        anyup_target_px: float,
+        allow_cpu: bool,
+    ):
         artifacts = runner.run(
             image=image,
             manual_clusters=int(cluster_count),
             allow_cpu=bool(allow_cpu),
             pca_dims=int(pca_dims),
+            anyup_target_short_side=int(anyup_target_px),
         )
         cpu_visible = artifacts.requires_cpu_confirmation or artifacts.device_type == "cpu"
         cpu_value = bool(allow_cpu) if cpu_visible else False
@@ -119,8 +126,16 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
                     info="PCA-compressed DINOv3 feature channels passed into AnyUp.",
                     minimum=8,
                     maximum=128,
-                    value=32,
+                    value=16,
                     step=8,
+                )
+                anyup_target_slider = gr.Slider(
+                    label="AnyUp target px",
+                    info="Short-side target for the AnyUp output map.",
+                    minimum=64,
+                    maximum=1024,
+                    value=128,
+                    step=16,
                 )
             cpu_confirm = gr.Checkbox(
                 label="MPS/CUDA unavailable. Check this box, then run again to allow CPU execution for the current input.",
@@ -139,7 +154,7 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
 
         run_button.click(
             fn=run_analysis,
-            inputs=[input_image, cluster_slider, pca_slider, cpu_confirm],
+            inputs=[input_image, cluster_slider, pca_slider, anyup_target_slider, cpu_confirm],
             outputs=[status, kmeans_slider, anyup_slider, cpu_confirm],
             show_progress="minimal",
         )
@@ -160,7 +175,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--share", action="store_true", help="Enable Gradio share links")
     parser.add_argument("--smoke-test", action="store_true", help="Run one pass and exit")
     parser.add_argument("--clusters", type=int, default=0, help="Cluster count; 0 uses the automatic heuristic")
-    parser.add_argument("--pca-dims", type=int, default=32, help="PCA dimensions for upsampled DINOv3 features")
+    parser.add_argument("--pca-dims", type=int, default=16, help="PCA dimensions for upsampled DINOv3 features")
+    parser.add_argument("--anyup-target-px", type=int, default=128, help="Short-side target for the AnyUp output map")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow CPU inference when MPS/CUDA is unavailable")
     return parser.parse_args()
 
@@ -175,6 +191,7 @@ def main() -> None:
             manual_clusters=args.clusters,
             allow_cpu=args.allow_cpu,
             pca_dims=args.pca_dims,
+            anyup_target_short_side=args.anyup_target_px,
         )
         print(artifacts.status)
         if artifacts.requires_cpu_confirmation:

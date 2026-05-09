@@ -19,6 +19,10 @@ DEFAULT_IMAGE_PATH = ROOT_DIR / "inputs" / "reference2.png"
 
 PATCH_SIZE = 16
 TARGET_SHORT_SIDE = 1200
+OUTPUT_SHORT_SIDE = 128
+MIN_ANYUP_TARGET = 64
+MAX_ANYUP_TARGET = 1024
+ANYUP_TARGET_STEP = 16
 MIN_CLUSTERS = 2
 MAX_CLUSTERS = 8
 MANUAL_CLUSTER_MAX = 40
@@ -187,6 +191,14 @@ def resize_for_model(image: Image.Image, target_short_side: int = TARGET_SHORT_S
     return image.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
 
 
+def resize_for_output(image: Image.Image, target_short_side: int = OUTPUT_SHORT_SIDE) -> Image.Image:
+    width, height = image.size
+    scale = target_short_side / min(width, height)
+    resized_w = max(1, int(round(width * scale)))
+    resized_h = max(1, int(round(height * scale)))
+    return image.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
+
+
 def preprocess_image(resized: Image.Image, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     array = np.asarray(resized, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
@@ -309,8 +321,9 @@ class DinoRunner:
         image: Image.Image | None,
         manual_clusters: int = 0,
         allow_cpu: bool = False,
-        pca_dims: int = 32,
+        pca_dims: int = 16,
         q_chunk_size: int = 256,
+        anyup_target_short_side: int = OUTPUT_SHORT_SIDE,
     ) -> RunArtifacts:
         if image is None:
             image = Image.open(DEFAULT_IMAGE_PATH).convert("RGB")
@@ -318,14 +331,18 @@ class DinoRunner:
             image = image.convert("RGB")
 
         display_image = resize_for_model(image, target_short_side=self.model_spec.target_short_side)
+        anyup_output_image = resize_for_output(
+            image,
+            target_short_side=max(MIN_ANYUP_TARGET, min(MAX_ANYUP_TARGET, int(anyup_target_short_side))),
+        )
         selection = select_device(allow_cpu=allow_cpu)
         if selection.device is None:
             return RunArtifacts(
                 status="\n".join(selection.status_lines),
                 kmeans_overlay=display_image,
                 kmeans_mask=display_image,
-                anyup_overlay=display_image,
-                anyup_mask=display_image,
+                anyup_overlay=anyup_output_image,
+                anyup_mask=anyup_output_image,
                 elapsed=0.0,
                 requires_cpu_confirmation=True,
                 device_type="unavailable",
@@ -334,24 +351,28 @@ class DinoRunner:
         return self._run_model(
             image=image,
             display_image=display_image,
+            anyup_output_image=anyup_output_image,
             manual_clusters=manual_clusters,
             device=selection.device,
             status_prefix=selection.status_lines,
             used_cpu_confirmation=selection.used_cpu_confirmation,
             pca_dims=pca_dims,
             q_chunk_size=q_chunk_size,
+            anyup_target_short_side=max(MIN_ANYUP_TARGET, min(MAX_ANYUP_TARGET, int(anyup_target_short_side))),
         )
 
     def _run_model(
         self,
         image: Image.Image,
         display_image: Image.Image,
+        anyup_output_image: Image.Image,
         manual_clusters: int,
         device: torch.device,
         status_prefix: List[str],
         used_cpu_confirmation: bool,
         pca_dims: int,
         q_chunk_size: int,
+        anyup_target_short_side: int,
     ) -> RunArtifacts:
         limit_lines = self._configure_device_limit(device)
         memory_before = collect_memory_stats(device)
@@ -360,10 +381,12 @@ class DinoRunner:
             method_lines, kmeans_overlay, kmeans_mask, anyup_overlay, anyup_mask = self._run_feature_upsampling(
                 source_image=image,
                 display_image=display_image,
+                anyup_output_image=anyup_output_image,
                 device=device,
                 manual_clusters=manual_clusters,
                 pca_dims=pca_dims,
                 q_chunk_size=q_chunk_size,
+                anyup_target_short_side=anyup_target_short_side,
             )
             synchronize_device(device)
             elapsed = time.perf_counter() - start_time
@@ -423,10 +446,12 @@ class DinoRunner:
         self,
         source_image: Image.Image,
         display_image: Image.Image,
+        anyup_output_image: Image.Image,
         device: torch.device,
         manual_clusters: int,
         pca_dims: int,
         q_chunk_size: int,
+        anyup_target_short_side: int,
     ) -> Tuple[List[str], Image.Image, Image.Image, Image.Image, Image.Image]:
         try:
             from .kMeans import build_overlay_from_features
@@ -454,7 +479,7 @@ class DinoRunner:
             grid_w=grid_w,
             cluster_count=cluster_count,
             source_image=source_image,
-            output_size=source_image.size,
+            output_size=anyup_output_image.size,
             device=device,
             upsampler=self.anyup,
             pca_dims=pca_dims,
@@ -466,7 +491,8 @@ class DinoRunner:
             f"Patch grid: {grid_h}x{grid_w}",
             f"Tokens: {tokens.shape[1]}",
             f"Clusters: {cluster_count} ({cluster_mode})",
-            f"AnyUp output size: {source_image.size[0]}x{source_image.size[1]}",
+            f"AnyUp output size: {anyup_output_image.size[0]}x{anyup_output_image.size[1]}",
+            f"AnyUp target short side: {anyup_target_short_side}",
             f"AnyUp projected dims: {projected_dim}",
             f"AnyUp q_chunk_size: {q_chunk_size}",
         ]
