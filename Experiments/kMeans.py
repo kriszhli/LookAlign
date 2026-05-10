@@ -58,6 +58,15 @@ def overlay_clusters(base_image: Image.Image, cluster_image: Image.Image, alpha:
     return Image.fromarray(blended, mode="RGB")
 
 
+def build_overlay_from_labels(
+    cluster_labels: np.ndarray,
+    base_image: Image.Image,
+) -> tuple[Image.Image, Image.Image]:
+    grid_h, grid_w = cluster_labels.shape
+    cluster_map = render_cluster_map(cluster_labels, grid_h, grid_w, base_image.size)
+    return overlay_clusters(base_image, cluster_map), cluster_map
+
+
 def build_overlay_from_features(
     patch_features: np.ndarray,
     grid_h: int,
@@ -71,5 +80,4 @@ def build_overlay_from_features(
         grid_w=grid_w,
         cluster_count=cluster_count,
     )
-    cluster_map = render_cluster_map(cluster_labels, grid_h, grid_w, base_image.size)
-    return overlay_clusters(base_image, cluster_map), cluster_map
+    return build_overlay_from_labels(cluster_labels, base_image)

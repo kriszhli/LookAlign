@@ -4,9 +4,14 @@ import gradio as gr
 from PIL import Image
 
 try:
-    from .dinoV3 import DEFAULT_IMAGE_PATH, DinoRunner, MODEL_SPEC
+    from .dinoV3 import (
+        DEFAULT_IMAGE_PATH,
+        DEFAULT_WATERSHED_ERODE_RADIUS,
+        DinoRunner,
+        MODEL_SPEC,
+    )
 except ImportError:
-    from dinoV3 import DEFAULT_IMAGE_PATH, DinoRunner, MODEL_SPEC
+    from dinoV3 import DEFAULT_IMAGE_PATH, DEFAULT_WATERSHED_ERODE_RADIUS, DinoRunner, MODEL_SPEC
 
 
 def build_interface(runner: DinoRunner) -> gr.Blocks:
@@ -52,37 +57,35 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
     def run_analysis(
         image: Image.Image,
         cluster_count: float,
-        pca_dims: float,
-        anyup_target_px: float,
+        watershed_erode_radius: float,
         allow_cpu: bool,
     ):
         artifacts = runner.run(
             image=image,
             manual_clusters=int(cluster_count),
             allow_cpu=bool(allow_cpu),
-            pca_dims=int(pca_dims),
-            anyup_target_short_side=int(anyup_target_px),
+            watershed_erode_radius=int(watershed_erode_radius),
         )
         cpu_visible = artifacts.requires_cpu_confirmation or artifacts.device_type == "cpu"
         cpu_value = bool(allow_cpu) if cpu_visible else False
         return (
             artifacts.status,
             (artifacts.kmeans_overlay, artifacts.kmeans_mask),
-            (artifacts.anyup_overlay, artifacts.anyup_mask),
+            (artifacts.watershed_overlay, artifacts.watershed_mask),
             gr.update(visible=cpu_visible, value=cpu_value),
         )
 
     def reset_cpu_confirmation():
         return gr.update(visible=False, value=False)
 
-    with gr.Blocks(title="DINOv3 AnyUp Viewer") as demo:
+    with gr.Blocks(title="DINOv3 Watershed Viewer") as demo:
         with gr.Column(elem_classes="app-shell"):
             gr.HTML(f"<style>{css}</style>")
             gr.Markdown(
                 """
                 <div class="app-header">
-                  <h2>DINOv3 AnyUp Viewer</h2>
-                  <div class="app-subtitle">DINOv3 patch KMeans baseline beside official AnyUp feature upsampling.</div>
+                  <h2>DINOv3 Watershed Viewer</h2>
+                  <div class="app-subtitle">DINOv3 patch KMeans baseline beside a watershed refinement of the KMeans label grid.</div>
                 </div>
                 """
             )
@@ -104,8 +107,8 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
                     type="pil",
                     slider_position=50,
                 )
-                anyup_slider = gr.ImageSlider(
-                    label="AnyUp: Overlay / Mask",
+                watershed_slider = gr.ImageSlider(
+                    label="Watershed: Overlay / Mask",
                     height=560,
                     elem_classes="surface",
                     show_label=True,
@@ -121,21 +124,13 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
                     value=0,
                     step=1,
                 )
-                pca_slider = gr.Slider(
-                    label="AnyUp feature dimensions",
-                    info="PCA-compressed DINOv3 feature channels passed into AnyUp.",
-                    minimum=8,
-                    maximum=128,
-                    value=16,
-                    step=8,
-                )
-                anyup_target_slider = gr.Slider(
-                    label="AnyUp target px",
-                    info="Short-side target for the AnyUp output map.",
-                    minimum=64,
-                    maximum=1024,
-                    value=128,
-                    step=16,
+                watershed_erode_slider = gr.Slider(
+                    label="Watershed erode radius",
+                    info="Per-region erosion radius used to create watershed seed markers.",
+                    minimum=0,
+                    maximum=32,
+                    value=DEFAULT_WATERSHED_ERODE_RADIUS,
+                    step=1,
                 )
             cpu_confirm = gr.Checkbox(
                 label="MPS/CUDA unavailable. Check this box, then run again to allow CPU execution for the current input.",
@@ -154,8 +149,8 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
 
         run_button.click(
             fn=run_analysis,
-            inputs=[input_image, cluster_slider, pca_slider, anyup_target_slider, cpu_confirm],
-            outputs=[status, kmeans_slider, anyup_slider, cpu_confirm],
+            inputs=[input_image, cluster_slider, watershed_erode_slider, cpu_confirm],
+            outputs=[status, kmeans_slider, watershed_slider, cpu_confirm],
             show_progress="minimal",
         )
         input_image.change(
@@ -169,14 +164,13 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DINOv3 AnyUp viewer")
+    parser = argparse.ArgumentParser(description="DINOv3 Watershed viewer")
     parser.add_argument("--host", default="127.0.0.1", help="Host interface for Gradio")
     parser.add_argument("--port", type=int, default=7860, help="Port for Gradio")
     parser.add_argument("--share", action="store_true", help="Enable Gradio share links")
     parser.add_argument("--smoke-test", action="store_true", help="Run one pass and exit")
     parser.add_argument("--clusters", type=int, default=0, help="Cluster count; 0 uses the automatic heuristic")
-    parser.add_argument("--pca-dims", type=int, default=16, help="PCA dimensions for upsampled DINOv3 features")
-    parser.add_argument("--anyup-target-px", type=int, default=128, help="Short-side target for the AnyUp output map")
+    parser.add_argument("--watershed-erode-radius", type=int, default=DEFAULT_WATERSHED_ERODE_RADIUS, help="Erosion radius used for watershed seed markers")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow CPU inference when MPS/CUDA is unavailable")
     return parser.parse_args()
 
@@ -190,8 +184,7 @@ def main() -> None:
             image=image,
             manual_clusters=args.clusters,
             allow_cpu=args.allow_cpu,
-            pca_dims=args.pca_dims,
-            anyup_target_short_side=args.anyup_target_px,
+            watershed_erode_radius=args.watershed_erode_radius,
         )
         print(artifacts.status)
         if artifacts.requires_cpu_confirmation:

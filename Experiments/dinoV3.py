@@ -19,10 +19,7 @@ DEFAULT_IMAGE_PATH = ROOT_DIR / "inputs" / "reference2.png"
 
 PATCH_SIZE = 16
 TARGET_SHORT_SIDE = 1200
-OUTPUT_SHORT_SIDE = 128
-MIN_ANYUP_TARGET = 64
-MAX_ANYUP_TARGET = 1024
-ANYUP_TARGET_STEP = 16
+DEFAULT_WATERSHED_ERODE_RADIUS = 8
 MIN_CLUSTERS = 2
 MAX_CLUSTERS = 8
 MANUAL_CLUSTER_MAX = 40
@@ -51,8 +48,8 @@ class RunArtifacts:
     status: str
     kmeans_overlay: Image.Image
     kmeans_mask: Image.Image
-    anyup_overlay: Image.Image
-    anyup_mask: Image.Image
+    watershed_overlay: Image.Image
+    watershed_mask: Image.Image
     elapsed: float
     requires_cpu_confirmation: bool = False
     device_type: str = "unknown"
@@ -191,14 +188,6 @@ def resize_for_model(image: Image.Image, target_short_side: int = TARGET_SHORT_S
     return image.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
 
 
-def resize_for_output(image: Image.Image, target_short_side: int = OUTPUT_SHORT_SIDE) -> Image.Image:
-    width, height = image.size
-    scale = target_short_side / min(width, height)
-    resized_w = max(1, int(round(width * scale)))
-    resized_h = max(1, int(round(height * scale)))
-    return image.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
-
-
 def preprocess_image(resized: Image.Image, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     array = np.asarray(resized, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
@@ -292,11 +281,6 @@ def resolve_cluster_count(num_patches: int, manual_clusters: int) -> Tuple[int, 
 class DinoRunner:
     def __init__(self, model_spec: ModelSpec) -> None:
         self.model_spec = model_spec
-        try:
-            from .anyUp import AnyUpUpsampler
-        except ImportError:
-            from anyUp import AnyUpUpsampler
-        self.anyup = AnyUpUpsampler()
 
     def _empty_outputs(self, size: Tuple[int, int]) -> Tuple[Image.Image, ...]:
         return (make_error_image(size),)
@@ -321,9 +305,7 @@ class DinoRunner:
         image: Image.Image | None,
         manual_clusters: int = 0,
         allow_cpu: bool = False,
-        pca_dims: int = 16,
-        q_chunk_size: int = 256,
-        anyup_target_short_side: int = OUTPUT_SHORT_SIDE,
+        watershed_erode_radius: int = DEFAULT_WATERSHED_ERODE_RADIUS,
     ) -> RunArtifacts:
         if image is None:
             image = Image.open(DEFAULT_IMAGE_PATH).convert("RGB")
@@ -331,18 +313,14 @@ class DinoRunner:
             image = image.convert("RGB")
 
         display_image = resize_for_model(image, target_short_side=self.model_spec.target_short_side)
-        anyup_output_image = resize_for_output(
-            image,
-            target_short_side=max(MIN_ANYUP_TARGET, min(MAX_ANYUP_TARGET, int(anyup_target_short_side))),
-        )
         selection = select_device(allow_cpu=allow_cpu)
         if selection.device is None:
             return RunArtifacts(
                 status="\n".join(selection.status_lines),
                 kmeans_overlay=display_image,
                 kmeans_mask=display_image,
-                anyup_overlay=anyup_output_image,
-                anyup_mask=anyup_output_image,
+                watershed_overlay=image,
+                watershed_mask=image,
                 elapsed=0.0,
                 requires_cpu_confirmation=True,
                 device_type="unavailable",
@@ -351,42 +329,33 @@ class DinoRunner:
         return self._run_model(
             image=image,
             display_image=display_image,
-            anyup_output_image=anyup_output_image,
             manual_clusters=manual_clusters,
             device=selection.device,
             status_prefix=selection.status_lines,
             used_cpu_confirmation=selection.used_cpu_confirmation,
-            pca_dims=pca_dims,
-            q_chunk_size=q_chunk_size,
-            anyup_target_short_side=max(MIN_ANYUP_TARGET, min(MAX_ANYUP_TARGET, int(anyup_target_short_side))),
+            watershed_erode_radius=max(0, int(watershed_erode_radius)),
         )
 
     def _run_model(
         self,
         image: Image.Image,
         display_image: Image.Image,
-        anyup_output_image: Image.Image,
         manual_clusters: int,
         device: torch.device,
         status_prefix: List[str],
         used_cpu_confirmation: bool,
-        pca_dims: int,
-        q_chunk_size: int,
-        anyup_target_short_side: int,
+        watershed_erode_radius: int,
     ) -> RunArtifacts:
         limit_lines = self._configure_device_limit(device)
         memory_before = collect_memory_stats(device)
         start_time = time.perf_counter()
         try:
-            method_lines, kmeans_overlay, kmeans_mask, anyup_overlay, anyup_mask = self._run_feature_upsampling(
+            method_lines, kmeans_overlay, kmeans_mask, watershed_overlay, watershed_mask = self._run_feature_upsampling(
                 source_image=image,
                 display_image=display_image,
-                anyup_output_image=anyup_output_image,
                 device=device,
                 manual_clusters=manual_clusters,
-                pca_dims=pca_dims,
-                q_chunk_size=q_chunk_size,
-                anyup_target_short_side=anyup_target_short_side,
+                watershed_erode_radius=watershed_erode_radius,
             )
             synchronize_device(device)
             elapsed = time.perf_counter() - start_time
@@ -395,8 +364,8 @@ class DinoRunner:
                 status="\n".join(method_lines),
                 kmeans_overlay=kmeans_overlay,
                 kmeans_mask=kmeans_mask,
-                anyup_overlay=anyup_overlay,
-                anyup_mask=anyup_mask,
+                watershed_overlay=watershed_overlay,
+                watershed_mask=watershed_mask,
                 elapsed=elapsed,
                 requires_cpu_confirmation=False,
                 device_type=device.type,
@@ -409,11 +378,11 @@ class DinoRunner:
             else:
                 message = f"DINOv3 AnyUp failed: {''.join(traceback.format_exception_only(type(error), error)).strip()}"
             artifact = RunArtifacts(
-                status=message,
+                status=message.replace("AnyUp", "Watershed"),
                 kmeans_overlay=make_error_image(image.size),
                 kmeans_mask=make_error_image(image.size),
-                anyup_overlay=make_error_image(image.size),
-                anyup_mask=make_error_image(image.size),
+                watershed_overlay=make_error_image(image.size),
+                watershed_mask=make_error_image(image.size),
                 elapsed=0.0,
                 requires_cpu_confirmation=False,
                 device_type=device.type,
@@ -421,7 +390,7 @@ class DinoRunner:
 
         memory_after = collect_memory_stats(device)
         summary_lines = list(status_prefix)
-        summary_lines.append("Method: DINOv3 KMeans + AnyUp")
+        summary_lines.append("Method: DINOv3 KMeans + Watershed")
         if used_cpu_confirmation:
             summary_lines.append("CPU confirmation: approved")
         summary_lines.extend(line for line in limit_lines if "recommended max" in line)
@@ -435,8 +404,8 @@ class DinoRunner:
             status="\n".join(message for message in summary_lines if message),
             kmeans_overlay=artifact.kmeans_overlay,
             kmeans_mask=artifact.kmeans_mask,
-            anyup_overlay=artifact.anyup_overlay,
-            anyup_mask=artifact.anyup_mask,
+            watershed_overlay=artifact.watershed_overlay,
+            watershed_mask=artifact.watershed_mask,
             elapsed=artifact.elapsed,
             requires_cpu_confirmation=artifact.requires_cpu_confirmation,
             device_type=artifact.device_type,
@@ -446,19 +415,16 @@ class DinoRunner:
         self,
         source_image: Image.Image,
         display_image: Image.Image,
-        anyup_output_image: Image.Image,
         device: torch.device,
         manual_clusters: int,
-        pca_dims: int,
-        q_chunk_size: int,
-        anyup_target_short_side: int,
+        watershed_erode_radius: int,
     ) -> Tuple[List[str], Image.Image, Image.Image, Image.Image, Image.Image]:
         try:
-            from .kMeans import build_overlay_from_features
-            from .anyUp import build_anyup_overlay_from_features
+            from .kMeans import build_overlay_from_labels, cluster_patch_features
+            from .watershed import build_watershed_overlay_from_labels
         except ImportError:
-            from kMeans import build_overlay_from_features
-            from anyUp import build_anyup_overlay_from_features
+            from kMeans import build_overlay_from_labels, cluster_patch_features
+            from watershed import build_watershed_overlay_from_labels
 
         tokens, patch_features, resized, grid_h, grid_w, cluster_count, cluster_mode = extract_patch_features(
             self.model_spec,
@@ -466,24 +432,22 @@ class DinoRunner:
             device,
             manual_clusters,
         )
-        kmeans_overlay, kmeans_mask = build_overlay_from_features(
+        cluster_labels = cluster_patch_features(
             patch_features=patch_features,
             grid_h=grid_h,
             grid_w=grid_w,
             cluster_count=cluster_count,
+        )
+        kmeans_overlay, kmeans_mask = build_overlay_from_labels(
+            cluster_labels=cluster_labels,
             base_image=source_image,
         )
-        anyup_overlay, anyup_mask, projected_dim = build_anyup_overlay_from_features(
-            patch_features=patch_features,
-            grid_h=grid_h,
-            grid_w=grid_w,
+        watershed_overlay, watershed_mask = build_watershed_overlay_from_labels(
+            cluster_labels=cluster_labels,
             cluster_count=cluster_count,
             source_image=source_image,
-            output_size=anyup_output_image.size,
-            device=device,
-            upsampler=self.anyup,
-            pca_dims=pca_dims,
-            q_chunk_size=q_chunk_size,
+            output_size=source_image.size,
+            erode_radius=watershed_erode_radius,
         )
         lines = [
             f"Model: {self.model_spec.label}",
@@ -491,9 +455,7 @@ class DinoRunner:
             f"Patch grid: {grid_h}x{grid_w}",
             f"Tokens: {tokens.shape[1]}",
             f"Clusters: {cluster_count} ({cluster_mode})",
-            f"AnyUp output size: {anyup_output_image.size[0]}x{anyup_output_image.size[1]}",
-            f"AnyUp target short side: {anyup_target_short_side}",
-            f"AnyUp projected dims: {projected_dim}",
-            f"AnyUp q_chunk_size: {q_chunk_size}",
+            f"Watershed output size: {source_image.size[0]}x{source_image.size[1]}",
+            f"Watershed erode radius: {watershed_erode_radius}",
         ]
-        return lines, kmeans_overlay, kmeans_mask, anyup_overlay, anyup_mask
+        return lines, kmeans_overlay, kmeans_mask, watershed_overlay, watershed_mask
