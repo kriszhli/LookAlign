@@ -12,6 +12,11 @@ import timm
 import torch
 import torch.nn.functional as F
 
+try:
+    from .watershed import DEFAULT_ERODE_RADIUS as DEFAULT_WATERSHED_ERODE_RADIUS, DEFAULT_MODAL_RADIUS as DEFAULT_WATERSHED_MODAL_RADIUS
+except ImportError:
+    from watershed import DEFAULT_ERODE_RADIUS as DEFAULT_WATERSHED_ERODE_RADIUS, DEFAULT_MODAL_RADIUS as DEFAULT_WATERSHED_MODAL_RADIUS
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -19,7 +24,6 @@ DEFAULT_IMAGE_PATH = ROOT_DIR / "inputs" / "reference2.png"
 
 PATCH_SIZE = 16
 TARGET_SHORT_SIDE = 1200
-DEFAULT_WATERSHED_ERODE_RADIUS = 8
 MIN_CLUSTERS = 2
 MAX_CLUSTERS = 8
 MANUAL_CLUSTER_MAX = 40
@@ -306,6 +310,7 @@ class DinoRunner:
         manual_clusters: int = 0,
         allow_cpu: bool = False,
         watershed_erode_radius: int = DEFAULT_WATERSHED_ERODE_RADIUS,
+        watershed_modal_radius: int = DEFAULT_WATERSHED_MODAL_RADIUS,
     ) -> RunArtifacts:
         if image is None:
             image = Image.open(DEFAULT_IMAGE_PATH).convert("RGB")
@@ -334,6 +339,7 @@ class DinoRunner:
             status_prefix=selection.status_lines,
             used_cpu_confirmation=selection.used_cpu_confirmation,
             watershed_erode_radius=max(0, int(watershed_erode_radius)),
+            watershed_modal_radius=max(0, int(watershed_modal_radius)),
         )
 
     def _run_model(
@@ -345,6 +351,7 @@ class DinoRunner:
         status_prefix: List[str],
         used_cpu_confirmation: bool,
         watershed_erode_radius: int,
+        watershed_modal_radius: int,
     ) -> RunArtifacts:
         limit_lines = self._configure_device_limit(device)
         memory_before = collect_memory_stats(device)
@@ -356,6 +363,7 @@ class DinoRunner:
                 device=device,
                 manual_clusters=manual_clusters,
                 watershed_erode_radius=watershed_erode_radius,
+                watershed_modal_radius=watershed_modal_radius,
             )
             synchronize_device(device)
             elapsed = time.perf_counter() - start_time
@@ -418,6 +426,7 @@ class DinoRunner:
         device: torch.device,
         manual_clusters: int,
         watershed_erode_radius: int,
+        watershed_modal_radius: int,
     ) -> Tuple[List[str], Image.Image, Image.Image, Image.Image, Image.Image]:
         try:
             from .kMeans import build_overlay_from_labels, cluster_patch_features
@@ -448,6 +457,7 @@ class DinoRunner:
             source_image=source_image,
             output_size=source_image.size,
             erode_radius=watershed_erode_radius,
+            modal_radius=watershed_modal_radius,
         )
         lines = [
             f"Model: {self.model_spec.label}",
@@ -457,5 +467,6 @@ class DinoRunner:
             f"Clusters: {cluster_count} ({cluster_mode})",
             f"Watershed output size: {source_image.size[0]}x{source_image.size[1]}",
             f"Watershed erode radius: {watershed_erode_radius}",
+            f"Watershed modal radius: {watershed_modal_radius}",
         ]
         return lines, kmeans_overlay, kmeans_mask, watershed_overlay, watershed_mask

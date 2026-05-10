@@ -3,6 +3,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 
 try:
     from .kMeans import OVERLAY_ALPHA, overlay_clusters, render_cluster_map
@@ -10,7 +11,8 @@ except ImportError:
     from kMeans import OVERLAY_ALPHA, overlay_clusters, render_cluster_map
 
 
-DEFAULT_ERODE_RADIUS = 8
+DEFAULT_ERODE_RADIUS = 10
+DEFAULT_MODAL_RADIUS = 6
 
 
 def _resize_label_grid(labels: np.ndarray, output_size: Tuple[int, int]) -> np.ndarray:
@@ -42,12 +44,32 @@ def _build_markers(labels: np.ndarray, cluster_count: int, erode_radius: int) ->
     return markers
 
 
+def _modal_value(window: np.ndarray) -> int:
+    values = window.astype(np.int32)
+    bincount = np.bincount(values)
+    return int(np.argmax(bincount))
+
+
+def _apply_modal_filter(labels: np.ndarray, modal_radius: int) -> np.ndarray:
+    if modal_radius <= 0:
+        return labels
+    kernel_size = 2 * modal_radius + 1
+    filtered = ndimage.generic_filter(
+        labels.astype(np.int32),
+        function=_modal_value,
+        size=(kernel_size, kernel_size),
+        mode="nearest",
+    )
+    return filtered.astype(np.int32)
+
+
 def watershed_refine_labels(
     cluster_labels: np.ndarray,
     cluster_count: int,
     source_image: Image.Image,
     output_size: Tuple[int, int],
     erode_radius: int = DEFAULT_ERODE_RADIUS,
+    modal_radius: int = DEFAULT_MODAL_RADIUS,
 ) -> np.ndarray:
     resized_labels = _resize_label_grid(cluster_labels, output_size)
     markers = _build_markers(resized_labels, cluster_count, max(0, int(erode_radius)))
@@ -59,7 +81,8 @@ def watershed_refine_labels(
     refined = watershed_markers.copy()
     unresolved = refined <= 0
     refined[unresolved] = resized_labels[unresolved] + 1
-    return refined - 1
+    refined_labels = refined - 1
+    return _apply_modal_filter(refined_labels, max(0, int(modal_radius)))
 
 
 def build_watershed_overlay_from_labels(
@@ -68,6 +91,7 @@ def build_watershed_overlay_from_labels(
     source_image: Image.Image,
     output_size: Tuple[int, int],
     erode_radius: int = DEFAULT_ERODE_RADIUS,
+    modal_radius: int = DEFAULT_MODAL_RADIUS,
 ) -> tuple[Image.Image, Image.Image]:
     refined_labels = watershed_refine_labels(
         cluster_labels=cluster_labels,
@@ -75,6 +99,7 @@ def build_watershed_overlay_from_labels(
         source_image=source_image,
         output_size=output_size,
         erode_radius=erode_radius,
+        modal_radius=modal_radius,
     )
     target_map = render_cluster_map(refined_labels, refined_labels.shape[0], refined_labels.shape[1], source_image.size)
     return overlay_clusters(source_image, target_map, OVERLAY_ALPHA), target_map

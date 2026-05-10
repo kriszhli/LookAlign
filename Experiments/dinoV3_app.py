@@ -7,11 +7,12 @@ try:
     from .dinoV3 import (
         DEFAULT_IMAGE_PATH,
         DEFAULT_WATERSHED_ERODE_RADIUS,
+        DEFAULT_WATERSHED_MODAL_RADIUS,
         DinoRunner,
         MODEL_SPEC,
     )
 except ImportError:
-    from dinoV3 import DEFAULT_IMAGE_PATH, DEFAULT_WATERSHED_ERODE_RADIUS, DinoRunner, MODEL_SPEC
+    from dinoV3 import DEFAULT_IMAGE_PATH, DEFAULT_WATERSHED_ERODE_RADIUS, DEFAULT_WATERSHED_MODAL_RADIUS, DinoRunner, MODEL_SPEC
 
 
 def build_interface(runner: DinoRunner) -> gr.Blocks:
@@ -58,6 +59,7 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
         image: Image.Image,
         cluster_count: float,
         watershed_erode_radius: float,
+        watershed_modal_radius: float,
         allow_cpu: bool,
     ):
         artifacts = runner.run(
@@ -65,6 +67,7 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
             manual_clusters=int(cluster_count),
             allow_cpu=bool(allow_cpu),
             watershed_erode_radius=int(watershed_erode_radius),
+            watershed_modal_radius=int(watershed_modal_radius),
         )
         cpu_visible = artifacts.requires_cpu_confirmation or artifacts.device_type == "cpu"
         cpu_value = bool(allow_cpu) if cpu_visible else False
@@ -132,6 +135,14 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
                     value=DEFAULT_WATERSHED_ERODE_RADIUS,
                     step=1,
                 )
+                watershed_modal_slider = gr.Slider(
+                    label="Watershed modal radius",
+                    info="Majority-vote smoothing radius applied to the watershed label map.",
+                    minimum=0,
+                    maximum=32,
+                    value=DEFAULT_WATERSHED_MODAL_RADIUS,
+                    step=1,
+                )
             cpu_confirm = gr.Checkbox(
                 label="MPS/CUDA unavailable. Check this box, then run again to allow CPU execution for the current input.",
                 value=False,
@@ -149,7 +160,7 @@ def build_interface(runner: DinoRunner) -> gr.Blocks:
 
         run_button.click(
             fn=run_analysis,
-            inputs=[input_image, cluster_slider, watershed_erode_slider, cpu_confirm],
+            inputs=[input_image, cluster_slider, watershed_erode_slider, watershed_modal_slider, cpu_confirm],
             outputs=[status, kmeans_slider, watershed_slider, cpu_confirm],
             show_progress="minimal",
         )
@@ -171,6 +182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-test", action="store_true", help="Run one pass and exit")
     parser.add_argument("--clusters", type=int, default=0, help="Cluster count; 0 uses the automatic heuristic")
     parser.add_argument("--watershed-erode-radius", type=int, default=DEFAULT_WATERSHED_ERODE_RADIUS, help="Erosion radius used for watershed seed markers")
+    parser.add_argument("--watershed-modal-radius", type=int, default=DEFAULT_WATERSHED_MODAL_RADIUS, help="Modal smoothing radius for the watershed label map")
     parser.add_argument("--allow-cpu", action="store_true", help="Allow CPU inference when MPS/CUDA is unavailable")
     return parser.parse_args()
 
@@ -185,6 +197,7 @@ def main() -> None:
             manual_clusters=args.clusters,
             allow_cpu=args.allow_cpu,
             watershed_erode_radius=args.watershed_erode_radius,
+            watershed_modal_radius=args.watershed_modal_radius,
         )
         print(artifacts.status)
         if artifacts.requires_cpu_confirmation:
